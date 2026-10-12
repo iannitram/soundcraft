@@ -4,21 +4,7 @@ Last updated: 2026-10-12 (nightly run 1). Based on upstream `acb08ff`.
 
 ## Review cursor
 
-First pass of WISHLIST.md item 1 finished on 2026-10-12 (about 05:00 UTC, before Ian's 06:00 cap).
-
-Read in full:
-- `crates/audio-io/src`: `lib.rs`, `buffer.rs`, `wav.rs`, `pcm.rs`, `aiff.rs`, `peaks.rs`, `symph.rs`.
-- `crates/dsp/src`: `meter.rs`, `spectrum.rs`, `offline.rs` (except the inside of `time_stretch`, `detect_transients`, `non_silent_ranges`), `biquad.rs` (coefficients, state).
-- `crates/engine/src`: `edit.rs`, `lib.rs` (undo/redo, `execute`), `cmd/edit.rs`, `cmd/edit_more.rs`, `cmd/clip.rs` (via a review agent), `cmd/audiosuite.rs`, `cmd/file.rs` (lines 196-300), `io.rs` (lines 15-140, 300-335, 480-610, 725-780).
-- `crates/model/src/clip.rs` (trim, fades, gain envelope).
-- `crates/playback/src`: `lib.rs`, `record.rs`, and the per-block path of `crates/mix/src/lib.rs` (via a review agent).
-
-Skimmed only (next pass starts here):
-1. `crates/audio-io/src/flac.rs` lines 80-379 (the encoder; already covered by round-trip property tests).
-2. `crates/dsp/src/offline.rs`: `time_stretch` body (~lines 260-360), `detect_transients`, `non_silent_ranges`.
-3. `crates/engine/src/io.rs`: lines 140-300 (video import, bounce helpers), 610-725, 780-1302 (bundles, web hosts).
-4. `crates/engine/src/cmd/clip_more.rs` (conform, effects render, remove pitch shift).
-5. `crates/engine/src/cmd/file.rs` lines 1-195 (command table).
+2026-10-12 run 2: the first full pass of WISHLIST item 1 is complete. Every file in its code areas has been read once (run 2 read the five skimmed areas: `flac.rs` encoder, `offline.rs` time_stretch/detect_transients/non_silent_ranges, `engine/src/io.rs` remaining lines, `cmd/clip_more.rs`, `cmd/file.rs` 1-195). Next pass: re-read after upstream changes (diff `acb08ff..upstream/main` in the item 1 areas), then the mixer's offline render paths (`mix/src/lib.rs` render_range/render_bus/render_clips) and `model/src/clip.rs` stretch handling.
 
 ## Open threads
 
