@@ -156,9 +156,11 @@ impl Quantizer {
     }
 }
 
-/// Clamp a float sample to [-1, 1], mapping NaN to 0.
-pub(crate) fn clamp_float(x: f32) -> f32 {
-    if x.is_nan() { 0.0 } else { x.clamp(-1.0, 1.0) }
+/// A float sample as stored in a 32-bit float file: values beyond full scale are kept (float
+/// files carry headroom, and clipping them on save loses audio for good); NaN and ±infinity,
+/// which no reader can use, become 0.
+pub(crate) fn finite_float(x: f32) -> f32 {
+    if x.is_finite() { x } else { 0.0 }
 }
 
 /// Check that a buffer is encodable: at least one channel and a non-zero sample rate.
