@@ -126,11 +126,24 @@ pub(crate) fn deinterleave(data: &[u8], kind: PcmKind, channels: usize, frames: 
             }
         }
     }
+    // `Scope::spawn` panics when the OS refuses a thread; a run that got none is decoded here
+    // afterwards instead.
+    let mut unspawned = Vec::new();
     std::thread::scope(|scope| {
-        for (chunk, part) in data.chunks(run.saturating_mul(block)).zip(parts) {
-            scope.spawn(move || deinterleave_into(chunk, kind, block, part));
+        for (i, (chunk, part)) in data.chunks(run.saturating_mul(block)).zip(parts).enumerate() {
+            if std::thread::Builder::new().spawn_scoped(scope, move || deinterleave_into(chunk, kind, block, part)).is_err() {
+                unspawned.push(i);
+            }
         }
     });
+    for i in unspawned {
+        let first = i.saturating_mul(run);
+        let chunk = data.get(first.saturating_mul(block)..).unwrap_or_default();
+        let chunk = chunk.get(..run.saturating_mul(block)).unwrap_or(chunk);
+        let end = first.saturating_add(run).min(frames);
+        let part = out.iter_mut().filter_map(|ch| ch.get_mut(first..end)).collect();
+        deinterleave_into(chunk, kind, block, part);
+    }
     Ok(out)
 }
 
