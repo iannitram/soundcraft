@@ -298,6 +298,22 @@ pub fn resample(ch: &[Vec<f32>], from: u32, to: u32) -> Vec<Vec<f32>> {
         .collect()
 }
 
+/// [`resample`] in place, one channel at a time: each input channel is freed as soon as its
+/// output exists, so peak memory is the input plus one output channel rather than the input
+/// plus the whole output (for a long stereo import, about a quarter less). Same output as
+/// [`resample`].
+pub fn resample_in_place(ch: &mut [Vec<f32>], from: u32, to: u32) {
+    if from == 0 || to == 0 || from == to {
+        return;
+    }
+    let ratio = f64::from(to) / f64::from(from);
+    for c in ch.iter_mut() {
+        let out_len = ((c.len() as f64 * ratio).round() as usize).min(MAX_OFFLINE_SAMPLES);
+        let out = resample_ratio(std::slice::from_ref(c), ratio, out_len).into_iter().next().unwrap_or_default();
+        *c = out;
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Time stretch (WSOLA) and pitch shift
 
@@ -611,6 +627,16 @@ pub fn peak_db(ch: &[Vec<f32>]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resample_in_place_matches_resample() {
+        let ch: Vec<Vec<f32>> = (0..2).map(|c| (0..10_000).map(|i| ((i * (c + 3)) as f32 * 0.01).sin() * 0.5).collect()).collect();
+        for (from, to) in [(44_100, 48_000), (48_000, 44_100), (48_000, 48_000), (0, 48_000)] {
+            let mut inplace = ch.clone();
+            resample_in_place(&mut inplace, from, to);
+            assert_eq!(inplace, resample(&ch, from, to), "{from} -> {to}");
+        }
+    }
 
     #[test]
     fn fade_shapes_endpoints() {
