@@ -4,7 +4,7 @@ Our priorities for this fork, in order. **Ian owns this file.** The nightly agen
 
 Use: spoken-word editing (podcast and audiobook voice-over). Long files: 1–3 hours, 48 kHz, often 32-bit float stereo WAV. Formats in and out: WAV, AIFF, MP3. Hardware: AMD Strix Halo laptop (Ryzen AI Max+ 395, 16 cores, full AVX-512, Radeon 8060S, SteamOS, RADV Vulkan, unified memory) and an Apple-Silicon Mac.
 
-*Last changed: 2026-10-12 (after run 3: local work and more decisions; see "Done locally" and Decisions at the end).*
+*Last changed: 2026-10-12 (local review of runs 1 to 3: four follow-up fixes and four rules for later runs; see "Done locally").*
 
 ## 1. Correctness of the crates we'll build on
 
@@ -53,7 +53,17 @@ Their ranked gaps in `docs/gaps.md`, skipping work that needs real hardware (G-0
 
 Daytime sessions on our own machines work in this repo too. Check this list and the fork's branches before starting an item.
 
-- `integration/nightly-2026-10-12`: every branch marked Ready through run 3 (not `perf/max-profile`, not `feat/mp3-export`), merged, plus the two local branches below. The full `cargo xtask ci` passes on it on Windows (709 tests). Never push to it or to `main`; keep basing your branches on `upstream/main` so each one can become a clean upstream PR.
+- `integration/nightly-2026-10-12`: every branch marked Ready through run 3 (not `perf/max-profile`, not `feat/mp3-export`), merged, plus the two local branches below, the review fixes in the next item, and upstream `main` up to `6cf896e` (0.6.1; 0.6.0 and 0.6.1 changed version numbers only). The full `cargo xtask ci` passes on it on Windows (714 tests, run at `c3296e2`, before the 0.6.1 version-number merge). Never push to it or to `main`; keep basing your branches on `upstream/main` so each one can become a clean upstream PR.
+- **Local review of runs 1 to 3 (2026-10-12).** Four Ready branches had defects. Each now has a follow-up commit on the same branch, so fetch before you touch them and never force-push them:
+  - `fix/offline-long-file-truncation` (`d6010cb`): the "grow 2x at most" rule still cut long low-rate files (two hours at 22.05 kHz lost ten minutes; three hours at 8 kHz stopped at 93 minutes). An output may now grow 8x within 2^30 samples per channel, and imports refuse a file that would still be cut (`resample_fits`).
+  - `perf/import-resample-memory` (`f82fb6c`): `resample_in_place` had its own copy of the old cap, so once merged with the fix above, imports were cut at 93 minutes again. Both resamplers now share `resampled_len`. (Merging the two branches conflicts in `resample`; the resolution on the integration branch is `resampled_len` calling `scaled_len`.)
+  - `fix/trim-to-file-stays-in-bounds` (`35b96c6`): `room_for` skipped a neighbour that overlaps the clip, which is what every crossfade leaves, so the trim grew across it.
+  - `perf/parallel-wav-decode` (`86f0867`): `Scope::spawn` panics when the OS refuses a thread. Now `Builder::spawn_scoped` with a fallback on the calling thread.
+- **What to take from that review, on every run:**
+  1. A branch is tested alone, but the build we use is all of them merged. When a branch adds a second path through a calculation that another open branch changes (a cap, a length, a rounding rule), share one helper instead of copying the expression, and name in the log every other open branch that touches the same function.
+  2. Clip-edit fixes: test with a crossfaded (overlapping) neighbour, not only clips that abut.
+  3. Length and rate arithmetic: test 8, 16 and 22.05 kHz inputs and 1 to 3 hour lengths, not only 44.1 and 48 kHz.
+  4. No `Scope::spawn` or `thread::spawn` outside tests: `Builder::spawn_scoped` and a fallback, as `fill_parallel` in `dsp/src/offline.rs` does.
 - `fix/ci-lint-fails-on-windows`: upstream's gate failed on Windows with Rust 1.95 (two clippy errors, a path-string test, the VST3 test fixture's bus-flag type, the late-exit test's order). Fixed, test code and one match guard only.
 - `fix/input-monitoring-latency-creeps`: the open thread "Input monitoring latency creeps to 0.5 s" is fixed (`playback/src/record.rs`, `InputRing` catches up; two tests).
 - **MP3 Huffman tables:** a local session will generate `huffman.rs` and commit it to `feat/mp3-export`. Don't try the conversion in the sandbox again. Until the file is there, do the MP3 parts that don't need it (bit reservoir, Xing/Info tag, wiring behind `encode`, test scaffolding with a decoder round trip), or move on to the next item.
