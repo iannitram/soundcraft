@@ -4,20 +4,21 @@ Our priorities for this fork, in order. **Ian owns this file.** The nightly agen
 
 Use: spoken-word editing (podcast and audiobook voice-over). Long files: 1–3 hours, 48 kHz, often 32-bit float stereo WAV. Formats in and out: WAV, AIFF, MP3. Hardware: AMD Strix Halo laptop (Ryzen AI Max+ 395, 16 cores, full AVX-512, Radeon 8060S, SteamOS, RADV Vulkan, unified memory) and an Apple-Silicon Mac.
 
-*Last changed: 2026-10-12 (first version).*
+*Last changed: 2026-10-12 (answers to the first two runs' "Needs Ian"; see Decisions at the end).*
 
 ## 1. Correctness of the crates we'll build on
 
 We plan an Audition-style single-file Waveform Editor (a separate repo) on top of SoundCraft's crates, so their correctness matters most to us.
 
 - Upstream gaps: G-04 (open correctness bugs)
-- Code areas: `crates/audio-io` (WAV/BWF/RF64, AIFF read/write, peaks), `crates/dsp` (`meter.rs` incl. the BS.1770 loudness meter, `offline.rs`, `spectrum.rs`), `crates/engine` (edit ops, undo, offline processing, file commands), `crates/playback`
+- Code areas: `crates/audio-io` (WAV/BWF/RF64, AIFF read/write, peaks), `crates/dsp` (`meter.rs` incl. the BS.1770 loudness meter, `offline.rs`, `spectrum.rs`), `crates/engine` (edit ops, undo, offline processing, file commands), `crates/playback`, `crates/mix` (offline render paths: `render_range`, `render_bus`, `render_clips`), `crates/model/src/clip.rs`
+- The first full pass is done (2026-10-12). From now on: first re-review what upstream changed in these areas since the review cursor's base commit, then the areas the cursor lists as next.
 - Look for: off-by-one in frame math, overflow on 1–3 hour files, sample-rate/channel mismatches, fades and gain at clip edges, undo that doesn't restore exactly, WAV/AIFF header edge cases, allocation or locks on the audio thread. Round-trip WAV and AIFF writes and compare samples.
 - One `fix/<slug>` branch per confirmed bug, with a regression test.
 
 ## 2. Upstream gaps that block our use
 
-- **G-21 compressed export:** we need MP3 out. Only with a permissively licensed encoder (no LAME/LGPL). If no clean MP3 encoder exists, write up the options and do what's clean.
+- **G-21 compressed export:** we need MP3 out. Only with a permissively licensed encoder (no LAME/LGPL). **Decided 2026-10-12: go with option 1 in `STATE.md`, our own clean-room encoder in `crates/audio-io`.** Work from ISO/IEC 11172-3 only. Start deliberately simple: CBR, no psychoacoustic model, behind `encode(.., FileFormat::Mp3)`, with a decoder round-trip test and a bench stage. Then the bit reservoir, a Xing/Info tag for gapless and seeking, joint stereo, and quality work. Tables may be ported from minimp3 (CC0); never from symphonia (MPL-2.0), LAME or Shine. Reviewable increments on `feat/mp3-export`, one or two per night; say in each log what a listener would hear at 96 and 128 kbps mono/stereo speech.
 - **G-06 disk streaming:** every source is decoded whole into RAM; long episodes are heavy. Design write-up first; code only if it's contained.
 - **G-14 PR CI** (`cargo xtask ci` on Linux/macOS/Windows): if pushing a workflow file is refused, put it in the log.
 
@@ -29,11 +30,12 @@ Upstream rates performance "~35 %, unmeasured". Measure first; every speed-up di
 - B1: an opt-in max-optimization profile (fat LTO, `codegen-units = 1`) measured against `release`. Don't change `release`.
 - B2: SIMD (runtime-dispatched) and `rayon` for work that splits cleanly: peaks, spectrogram, offline analysis and renders. Identical output, tested.
 - B3: spectrogram and waveform drawn from GPU data (`wgpu` compute + texture).
+- Long-file import speed and memory: decode and resample on all cores with identical output, and lower peak memory when opening 1–3 hour files (ties into G-06).
 - B4/B5: Linux audio path (PipeWire/JACK, realtime thread priority, buffer size; overlaps upstream G-01) and Linux/Wayland/gamescope compatibility: write-ups, since they need the real machine.
 - Code areas: `Cargo.toml` profiles, `crates/audio-io/src/peaks.rs`, `crates/dsp`, `crates/mix`, `crates/playback`, `crates/ui-egui` (waveform/meter drawing)
 - Anything needing the real GPU or audio hardware goes under "Needs Z13 testing" with exact steps.
 
-## 4. Waveform Editor design (write-up only until Ian approves it)
+## 4. Waveform Editor design (write-up only until Ian starts the design phase)
 
 An Adobe Audition-style Waveform Editor in a new repo, depending on SoundCraft's crates: one file at a time; waveform plus spectral frequency display; time and spectral selection; destructive edits; undo history; Effects Rack; noise print → noise reduction; Match Loudness to LUFS targets; markers; Audition layout and shortcuts. Keep design notes in `STATE.md`. No code for it in this fork.
 
@@ -46,3 +48,14 @@ An Adobe Audition-style Waveform Editor in a new repo, depending on SoundCraft's
 ## 5. Help upstream's goals
 
 Their ranked gaps in `docs/gaps.md`, skipping work that needs real hardware (G-01, G-02, G-03, G-10, G-11, G-12) or an owner decision (G-22).
+
+## Decisions
+
+Answers to "Needs Ian" items, newest first. Don't raise these again unless something changes.
+
+- 2026-10-12, **MP3 export (G-21):** option 1, our own clean-room encoder. See item 2.
+- 2026-10-12, **render memory cap:** accepted as `fix/long-render-truncation` has it (2^31 samples on 64-bit targets, 2^29 on 32-bit, a clear error beyond that).
+- 2026-10-12, **float writes keep headroom:** keep `fix/float-writes-keep-headroom` on its branch. Not proposed upstream yet; it stays in the "ready for an upstream PR, behaviour change" list.
+- 2026-10-12, **Waveform Editor direction:** accepted as the working assumption: depend on `audio-io`, `dsp` and `time` (not `engine`), as a git dependency pinned to an upstream tag, with the editor's own undo and markers. Still write-up only; no editor code here.
+- 2026-10-12, **wishlist suggestions:** both taken (`crates/mix` under item 1; long-file import under item 3).
+- 2026-10-12, **upstream PRs:** none approved yet. Keep the draft titles current in the log.
