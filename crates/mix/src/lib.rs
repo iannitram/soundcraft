@@ -1539,6 +1539,11 @@ fn build_matrix(src_fmt: ChannelFormat, ns: usize, dst_fmt: ChannelFormat, nd: u
             *x += g;
         }
     };
+    if nd == 1 && ns == 1 {
+        // Mono into mono has no panner, so no pan law: unity gain.
+        m[0][0] = 1.0;
+        return m;
+    }
     if nd == 1 {
         // Mono destination: the stereo routing summed at -6 dB.
         let st = build_matrix(src_fmt, ns, ChannelFormat::Stereo, 2, pan, law);
@@ -2123,6 +2128,17 @@ mod tests {
         assert!(out[0][30_000].abs() < 1e-4);
     }
 
+    /// Regression: a mono track on a mono bus went through the stereo pan law and lost 3 dB.
+    #[test]
+    fn mono_track_into_mono_bus_is_unity_gain() {
+        let (mut s, t) = session_with_dc(0.5, 4800);
+        let vo = s.add_bus("VO", ChannelFormat::Mono);
+        s.track_mut(t).unwrap().mixer.output = Route::Bus(vo);
+        let bus = render_bus(&s, vo, Range::new(0, 4800), 512);
+        assert_eq!(bus.len(), 1);
+        assert!((bus[0][1000] - 0.5).abs() < 1e-5, "mono bus level {}", bus[0][1000]);
+    }
+
     #[test]
     fn inserts_process_and_survive_unknown_plugins() {
         let (mut s, t) = session_with_dc(0.5, 4800);
@@ -2528,7 +2544,8 @@ mod tests {
             let x = 0.1 * (c + 1) as f32 + (1000 % 7) as f32 * 1e-3;
             assert!((ch[1000] - x * g).abs() < 1e-5, "channel {c}: {} vs {}", ch[1000], x * g);
         }
-        // A mono bus sums a stereo source like the old stereo bus did.
+        // A mono track reaches a mono bus at unity (no pan law), then the mono aux, panned
+        // hard left, plays at full level on the left.
         let (mut s, t) = session_with_dc(0.5, 4800);
         let bus = s.add_bus("Mono", ChannelFormat::Mono);
         let aux = s.add_track(TrackKind::Aux, ChannelFormat::Mono, Some("M"));
@@ -2536,7 +2553,7 @@ mod tests {
         s.track_mut(aux).unwrap().mixer.pan = vec![-1.0];
         s.track_mut(t).unwrap().mixer.output = Route::Bus(bus);
         let out = render_range(&s, Range::new(0, 4800), 512);
-        assert!((out[0][1000] - 0.5 * gains(0.0, PanLaw::Minus3).0).abs() < 1e-6, "{}", out[0][1000]);
+        assert!((out[0][1000] - 0.5 * gains(-1.0, PanLaw::Minus3).0).abs() < 1e-6, "{}", out[0][1000]);
     }
 
     #[test]
