@@ -907,6 +907,10 @@ pub fn plan_takes(e: &Engine, unsaved_dir: &Path, input_channels: usize) -> Vec<
     let dir = e.path.as_deref().and_then(|p| Path::new(p).parent()).unwrap_or(unsaved_dir);
     let s = e.session();
     let take_no = s.sources.len() + 1;
+    // Paths already given out in this plan, compared case-insensitively: two track names can
+    // sanitize to the same file name ("Host?" and "Host!"), or differ only by case, which is
+    // the same file on default macOS and Windows file systems.
+    let mut taken = std::collections::HashSet::new();
     s.tracks
         .iter()
         .filter(|t| t.mixer.record_arm && t.kind == TrackKind::Audio && !t.inactive)
@@ -919,7 +923,9 @@ pub fn plan_takes(e: &Engine, unsaved_dir: &Path, input_channels: usize) -> Vec<
             };
             let inputs = (0..t.channels()).map(|k| first.saturating_add(k) % input_channels.max(1)).collect();
             let file = |n: usize| dir.join("Audio Files").join(format!("{}_{n:02}.wav", sanitize_name(&t.name)));
-            let path = (take_no..take_no + 1_000).map(file).find(|p| !p.exists()).unwrap_or_else(|| file(take_no));
+            let key = |p: &Path| p.to_string_lossy().to_lowercase();
+            let path = (take_no..take_no + 1_000).map(file).find(|p| !p.exists() && !taken.contains(&key(p))).unwrap_or_else(|| file(take_no));
+            taken.insert(key(&path));
             (t.id, inputs, path)
         })
         .collect()
@@ -1010,6 +1016,18 @@ mod record_tests {
         e.execute("edit.undo", &json!({})).unwrap();
         assert!(e.session().find_clip(clips[0]).is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn armed_tracks_never_share_a_take_file() {
+        let dir = std::env::temp_dir().join(format!("soundcraft-take-names-{}", std::process::id()));
+        let mut e = Engine::default();
+        armed(&mut e, "Host?", "mono", "In 1");
+        armed(&mut e, "Host!", "mono", "In 2");
+        armed(&mut e, "host_", "mono", "In 3");
+        let paths: Vec<PathBuf> = plan_takes(&e, &dir, 4).into_iter().map(|(_, _, p)| p).collect();
+        let files = ["Host__01.wav", "Host__02.wav", "host__03.wav"];
+        assert_eq!(paths, files.iter().map(|f| dir.join("Audio Files").join(f)).collect::<Vec<_>>());
     }
 
     #[test]
