@@ -4,7 +4,7 @@ Our priorities for this fork, in order. **Ian owns this file.** The nightly agen
 
 Use: spoken-word editing (podcast and audiobook voice-over). Long files: 1–3 hours, 48 kHz, often 32-bit float stereo WAV. Formats in and out: WAV, AIFF, MP3. Hardware: AMD Strix Halo laptop (Ryzen AI Max+ 395, 16 cores, full AVX-512, Radeon 8060S, SteamOS, RADV Vulkan, unified memory) and an Apple-Silicon Mac.
 
-*Last changed: 2026-10-12 (local review of runs 1 to 3: four follow-up fixes and four rules for later runs; see "Done locally").*
+*Last changed: 2026-10-12 (first upstream PR, #324; two more rules for later runs, on flaky tests and Rust versions; see "Done locally" and Decisions).*
 
 ## 1. Correctness of the crates we'll build on
 
@@ -64,7 +64,9 @@ Daytime sessions on our own machines work in this repo too. Check this list and 
   2. Clip-edit fixes: test with a crossfaded (overlapping) neighbour, not only clips that abut.
   3. Length and rate arithmetic: test 8, 16 and 22.05 kHz inputs and 1 to 3 hour lengths, not only 44.1 and 48 kHz.
   4. No `Scope::spawn` or `thread::spawn` outside tests: `Builder::spawn_scoped` and a fallback, as `fill_parallel` in `dsp/src/offline.rs` does.
-- `fix/ci-lint-fails-on-windows`: upstream's gate failed on Windows with Rust 1.95 (two clippy errors, a path-string test, the VST3 test fixture's bus-flag type, the late-exit test's order). Fixed, test code and one match guard only.
+  5. Two upstream tests are flaky (upstream issue #323): `edit_window::tests::shift_click_adds_another_track_to_the_selection` and `theme::tests::application_frames_follow_system_appearance_and_preserve_manual_palettes` in `crates/ui-egui`, about one run in twenty when tests run in parallel. If a gate run fails on one of them only, run it again before reporting a failure. Don't fix them on our branches.
+  6. Say in the log which Rust version every result came from. The `collapsible_match` lint error in `crates/video/src/isobmff/codec.rs` is raised by Rust 1.95 only (any platform); Rust 1.99 does not raise it. A branch that fails lint on that line alone, with 1.95, is not at fault.
+- `fix/ci-lint-fails-on-windows`: upstream's gate failed on Windows (an unused variable in a test, the VST3 test fixture's bus-flag type, a path-string test, the late-exit test's order) and, with Rust 1.95 only, on one clippy error on any platform. Fixed, test code and one match guard only. **Sent upstream as PR #324 (2026-10-12)** from `fix/gate-on-windows-and-rust-1.95`, which holds the same changes rebuilt on upstream `main`. Never push to that branch; if #324 has merged by the time you run, say so in the log.
 - `fix/input-monitoring-latency-creeps`: the open thread "Input monitoring latency creeps to 0.5 s" is fixed (`playback/src/record.rs`, `InputRing` catches up; two tests).
 - **MP3 Huffman tables:** a local session will generate `huffman.rs` and commit it to `feat/mp3-export`. Don't try the conversion in the sandbox again. Until the file is there, do the MP3 parts that don't need it (bit reservoir, Xing/Info tag, wiring behind `encode`, test scaffolding with a decoder round trip), or move on to the next item.
 
@@ -79,4 +81,4 @@ Answers to "Needs Ian" items, newest first. Don't raise these again unless somet
 - 2026-10-12, **float writes keep headroom:** keep `fix/float-writes-keep-headroom` on its branch. Not proposed upstream yet; it stays in the "ready for an upstream PR, behaviour change" list.
 - 2026-10-12, **Waveform Editor direction:** accepted as the working assumption: depend on `audio-io`, `dsp` and `time` (not `engine`), as a git dependency pinned to an upstream tag, with the editor's own undo and markers. Still write-up only; no editor code here.
 - 2026-10-12, **wishlist suggestions:** both taken (`crates/mix` under item 1; long-file import under item 3).
-- 2026-10-12, **upstream PRs:** none approved yet. Keep the draft titles current in the log.
+- 2026-10-12, **upstream PRs:** the first is open (#324, the gate fix). Approved next, once it lands: `fix/offline-long-file-truncation`, then `fix/unique-take-paths`. A local session opens them; you never open PRs, issues or comments upstream. Keep the draft titles current in the log, and tell us when an upstream PR by someone else lands that overlaps one of our branches (#292 and #290 already overlap `fix/trim-to-file-stays-in-bounds` and `fix/shuffle-ripples-automation`; #210 and #295 touch the code of `fix/playback-resample-block-edge` and `fix/automation-block-independent`).
