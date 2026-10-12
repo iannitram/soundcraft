@@ -307,9 +307,25 @@ pub fn move_clips(s: &mut Session, ids: &[ClipId], delta: Samples, to_track: Opt
         }
     }
     let n = moving.len();
+    // Clear what every moved clip lands on first, then insert them together: placing them one at
+    // a time let a later clip clear the overlapping tail (and fade) of an earlier one, destroying
+    // a crossfade between clips that move together.
+    let mut placed: Vec<(TrackId, Clip)> = Vec::with_capacity(n);
     for (tid, mut c) in moving {
         c.start = c.start.saturating_add(delta).max(0);
-        place_clip(s, to_track.unwrap_or(tid), c);
+        let dest = to_track.unwrap_or(tid);
+        clear_range(s, dest, c.range(), false);
+        placed.push((dest, c));
+    }
+    for (dest, c) in placed {
+        if let Some(pl) = s.track_mut(dest).and_then(|t| t.playlist_mut()) {
+            pl.clips.push(c);
+        }
+    }
+    for t in &mut s.tracks {
+        if let Some(pl) = t.playlist_mut() {
+            pl.sort();
+        }
     }
     n
 }
@@ -584,5 +600,29 @@ mod tests {
         assert_eq!(clips(&s, t), vec![(1500, 4000, 1000)]);
         s.find_clip_mut(id).unwrap().time_locked = true;
         assert_eq!(move_clips(&mut s, &[id], 500, None), 0);
+    }
+
+    #[test]
+    fn moving_crossfaded_clips_together_keeps_the_crossfade() {
+        let (mut s, t) = session_with_clip();
+        separate_at(&mut s, t, 3000);
+        assert_eq!(create_fades(&mut s, t, Range::new(2900, 3100), FadeShape::Linear), 1);
+        let before: Vec<Clip> = s.track(t).unwrap().clips().to_vec();
+        let ids: Vec<ClipId> = before.iter().map(|c| c.id).collect();
+        assert_eq!(move_clips(&mut s, &ids, 2000, None), 2);
+        let after: Vec<Clip> = s.track(t).unwrap().clips().to_vec();
+        assert_eq!(after.len(), 2);
+        for (a, b) in before.iter().zip(&after) {
+            assert_eq!(
+                (b.start, b.length, b.source_offset(), b.fade_in.len, b.fade_out.len),
+                (a.start + 2000, a.length, a.source_offset(), a.fade_in.len, a.fade_out.len)
+            );
+        }
+        // A moved clip still overwrites what it lands on.
+        let (mut s, t) = session_with_clip();
+        separate_at(&mut s, t, 3000);
+        let first = s.track(t).unwrap().clips()[0].id;
+        assert_eq!(move_clips(&mut s, &[first], 1000, None), 1);
+        assert_eq!(clips(&s, t), vec![(2000, 2000, 1000), (4000, 1000, 4000)]);
     }
 }
