@@ -669,7 +669,9 @@ impl MixEngine {
             self.strips.insert(t.id, st);
         }
         self.order = order;
-        // Master faders process the main mix.
+        // Master faders process the main mix. Their inserts' lookahead delays everything equally;
+        // it is part of the mix latency so an offline render can drop it like the rest.
+        let mut lmax_m = 0usize;
         for t in s.tracks.iter().filter(|t| t.kind == TrackKind::Master && !t.inactive) {
             if let Some(strip) = self.strips.get_mut(&t.id) {
                 for (dst, src) in strip.buf.iter_mut().zip(self.main.iter()) {
@@ -684,6 +686,7 @@ impl MixEngine {
                     {
                         apply_params(slot, ins, t, i, pos);
                         slot.plugin.process(&mut strip.buf, frames);
+                        lmax_m = lmax_m.saturating_add(slot.plugin.latency());
                     }
                 }
                 let v0 = volume_db_at(t, pos);
@@ -700,6 +703,9 @@ impl MixEngine {
                 }
                 self.meters.entry(t.id).or_default().measure(&self.main, frames, 0.0);
             }
+        }
+        if pdc {
+            self.latency = self.latency.saturating_add(lmax_m);
         }
         // Metronome: summed after the master fader, so it reaches the speakers without passing
         // through any track, send or insert. Only the playback engine sets `metronome`.
@@ -2285,6 +2291,27 @@ mod tests {
         s.edit.delay_compensation = false;
         let out = render_range(&s, Range::new(0, 8000), 512);
         assert_ne!(argmax(&out[0]), argmax(&out[1]));
+    }
+
+    /// A lookahead insert on the Master (the usual Maximizer) must not shift or shorten a bounce.
+    #[test]
+    fn delay_compensation_covers_master_inserts() {
+        let mut s = Session::default();
+        let mut imp = vec![0.0f32; 48_000];
+        imp[1000] = 1.0;
+        imp[7990] = 0.5;
+        s.pool.insert(SourceId(902), Arc::new(SourceAudio::new(AudioBuffer { sample_rate: 48_000, channels: vec![imp] })));
+        let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+        let cid = s.new_clip_id();
+        s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(Clip::audio(cid, "i", SourceId(902), 0, 0, 48_000));
+        let m = s.add_track(TrackKind::Master, ChannelFormat::Stereo, None);
+        s.track_mut(m).unwrap().mixer.inserts[0] = Some(Insert::new("maximizer"));
+        assert!(soundcraft_dsp::create("maximizer").unwrap().latency() > 0, "test needs a latent plugin");
+        let out = render_range(&s, Range::new(0, 8000), 512);
+        assert_eq!(out[0].len(), 8000);
+        let hits = impulse_at(&out[0]);
+        assert_eq!(hits.first(), Some(&1000), "master lookahead shifted the bounce: {hits:?}");
+        assert!(hits.contains(&7990), "master lookahead cut the end of the bounce: {hits:?}");
     }
 
     fn impulse_at(ch: &[f32]) -> Vec<usize> {
