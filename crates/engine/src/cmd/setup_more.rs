@@ -406,6 +406,9 @@ fn load_source(dir: &Path, src: &Source, sr: u32) -> Option<soundcraft_audio_io:
     let p = if Path::new(&src.path).is_absolute() { PathBuf::from(&src.path) } else { dir.join(&src.path) };
     let bytes = std::fs::read(&p).ok()?;
     let (_, mut buf) = soundcraft_audio_io::decode(&bytes, p.extension().and_then(|x| x.to_str())).ok()?;
+    if !soundcraft_dsp::offline::resample_fits(buf.frames(), buf.sample_rate, sr) {
+        return None;
+    }
     if buf.sample_rate != sr && buf.sample_rate > 0 {
         buf.channels = soundcraft_dsp::offline::resample(&buf.channels, buf.sample_rate, sr);
         buf.sample_rate = sr;
