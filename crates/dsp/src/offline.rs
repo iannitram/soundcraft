@@ -16,16 +16,39 @@ use crate::{Plugin, db_to_gain, gain_to_db};
 /// about 93 minutes at 48 kHz. Longer inputs get more room; see [`scaled_len`].
 pub const MAX_OFFLINE_SAMPLES: usize = 1 << 28;
 
-/// How many times its input length an offline output may grow to when the input is already
-/// longer than [`MAX_OFFLINE_SAMPLES`] (covers sample-rate conversion up to 2× and stretches up to 2×).
+/// How many times its input length an offline output may always grow to, however long the input
+/// (stretches up to 2×).
 pub const MAX_LONG_INPUT_GROWTH: usize = 2;
 
+/// How many times its input length an offline output may grow to while it stays within
+/// [`MAX_LONG_OUTPUT_SAMPLES`]: conversion between any two common sample rates (16 → 48 kHz is
+/// 3×, 8 → 48 kHz is 6×).
+pub const MAX_RATE_GROWTH: usize = 8;
+
+/// Output size (samples per channel) up to which [`MAX_RATE_GROWTH`] applies: 2^30 f32 = 4 GiB,
+/// about 6 h 12 min at 48 kHz. On 32-bit targets, which could not allocate that, the same as
+/// [`MAX_OFFLINE_SAMPLES`].
+#[cfg(target_pointer_width = "64")]
+pub const MAX_LONG_OUTPUT_SAMPLES: usize = 1 << 30;
+/// See the 64-bit definition.
+#[cfg(not(target_pointer_width = "64"))]
+pub const MAX_LONG_OUTPUT_SAMPLES: usize = MAX_OFFLINE_SAMPLES;
+
+/// Most samples an operation may turn `len` input samples into: [`MAX_OFFLINE_SAMPLES`],
+/// `MAX_LONG_INPUT_GROWTH × len`, or `MAX_RATE_GROWTH × len` up to [`MAX_LONG_OUTPUT_SAMPLES`],
+/// whichever is largest.
+fn output_cap(len: usize) -> usize {
+    let converted = len.saturating_mul(MAX_RATE_GROWTH).min(MAX_LONG_OUTPUT_SAMPLES);
+    MAX_OFFLINE_SAMPLES.max(len.saturating_mul(MAX_LONG_INPUT_GROWTH)).max(converted)
+}
+
 /// Output length for an operation that turns `len` input samples into `len × ratio`: rounded and
-/// capped at [`MAX_OFFLINE_SAMPLES`] or `MAX_LONG_INPUT_GROWTH × len`, whichever is larger. A
+/// capped (see [`MAX_OFFLINE_SAMPLES`], [`MAX_LONG_INPUT_GROWTH`] and [`MAX_RATE_GROWTH`]). A
 /// hostile ratio can't allocate without bound, and a long recording (a 2-hour audiobook is ~345 M
-/// samples at 48 kHz) is not cut short by a cap sized for short clips.
+/// samples at 48 kHz) is not cut short by a cap sized for short clips. Callers that keep the
+/// result check [`scaled_len_fits`] first.
 pub fn scaled_len(len: usize, ratio: f64) -> usize {
-    let cap = MAX_OFFLINE_SAMPLES.max(len.saturating_mul(MAX_LONG_INPUT_GROWTH));
+    let cap = output_cap(len);
     let want = len as f64 * ratio;
     if !want.is_finite() || want <= 0.0 {
         return 0;
@@ -38,6 +61,18 @@ pub fn scaled_len(len: usize, ratio: f64) -> usize {
         return cap;
     }
     want as usize
+}
+
+/// Whether [`scaled_len`] gives `len × ratio` whole rather than cut at the cap.
+pub fn scaled_len_fits(len: usize, ratio: f64) -> bool {
+    let want = (len as f64 * ratio).round();
+    want.is_nan() || want <= output_cap(len) as f64
+}
+
+/// Whether [`resample`] converts all of a `len`-sample channel from `from` Hz to `to` Hz, rather
+/// than returning it cut at the cap.
+pub fn resample_fits(len: usize, from: u32, to: u32) -> bool {
+    from == 0 || to == 0 || from == to || scaled_len_fits(len, f64::from(to) / f64::from(from))
 }
 
 /// Fade curves. [`FadeShape::gain`] is the fade-in curve; a fade-out uses `gain(1 - t)`.
@@ -657,6 +692,21 @@ mod tests {
         fade(&mut ch, 1000, 1000, FadeShape::SCurve);
     }
 
+    /// Regression: the first fix let long inputs grow 2× at most, so two hours at 22.05 kHz (a
+    /// spoken-word MP3) still lost their last ten minutes in a 48 kHz session, and three hours at
+    /// 8 kHz stopped at 93 minutes.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn long_low_rate_inputs_are_not_cut_short() {
+        for (rate, secs) in [(22_050usize, 7_200usize), (16_000, 9_000), (8_000, 10_800), (11_025, 10_800)] {
+            let ratio = 48_000.0 / rate as f64;
+            assert_eq!(scaled_len(rate * secs, ratio), 48_000 * secs, "{rate} Hz, {secs} s");
+            assert!(resample_fits(rate * secs, rate as u32, 48_000), "{rate} Hz, {secs} s");
+        }
+        // 44.1 → 96 kHz, two hours.
+        assert_eq!(scaled_len(44_100 * 7_200, 96_000.0 / 44_100.0), 96_000 * 7_200);
+    }
+
     #[test]
     fn long_inputs_are_not_cut_to_the_short_clip_cap() {
         // A 2-hour 44.1 kHz audiobook resampled to 48 kHz used to stop at MAX_OFFLINE_SAMPLES
@@ -666,10 +716,16 @@ mod tests {
         // A latency/tail render of a 3-hour file keeps every input sample.
         let three_hours = 48_000 * 10_800;
         assert_eq!(scaled_len(three_hours, 1.0), three_hours);
-        // Short inputs keep the old fixed cap; long ones may at most double.
+        // Short inputs keep the old fixed cap. Long ones may always double, and grow further
+        // only up to MAX_LONG_OUTPUT_SAMPLES.
         assert_eq!(scaled_len(10, 1e12), MAX_OFFLINE_SAMPLES);
-        assert_eq!(scaled_len(three_hours, 10.0), three_hours * MAX_LONG_INPUT_GROWTH);
+        assert!(!scaled_len_fits(10, 1e12) && !resample_fits(1 << 20, 1, 384_000));
+        assert_eq!(scaled_len(three_hours, 10.0), MAX_LONG_OUTPUT_SAMPLES.max(three_hours * MAX_LONG_INPUT_GROWTH));
+        assert!(!scaled_len_fits(three_hours, 10.0) && scaled_len_fits(three_hours, 2.0));
         assert_eq!(scaled_len(usize::MAX, 4.0), usize::MAX);
+        // Nothing to convert always fits.
+        assert!(resample_fits(usize::MAX, 0, 48_000) && resample_fits(usize::MAX, 48_000, 48_000) && scaled_len_fits(1000, f64::NAN));
+        assert!(!scaled_len_fits(1000, f64::INFINITY));
         // Degenerate ratios produce nothing.
         assert_eq!(scaled_len(1000, f64::NAN), 0);
         assert_eq!(scaled_len(1000, -1.0), 0);
