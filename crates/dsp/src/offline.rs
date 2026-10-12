@@ -206,27 +206,72 @@ impl SincTable {
     }
 }
 
+/// Output samples per worker below which [`fill_parallel`] stays on the calling thread.
+const PARALLEL_MIN_CHUNK: usize = 1 << 16;
+
+/// Fills `out` by calling `f(first_index, chunk)` on contiguous chunks, spread over the machine's
+/// cores with scoped threads. Every output sample depends only on its index, so the result is
+/// identical to one sequential call. Deliberately not the rayon pool: the realtime mixer runs its
+/// strips there, and a long offline job must not hold it. Without threads (wasm, a failed spawn)
+/// the work runs on the calling thread.
+fn fill_parallel(out: &mut [f32], f: impl Fn(usize, &mut [f32]) + Sync) {
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(out.len() / PARALLEL_MIN_CHUNK).max(1);
+    if threads <= 1 {
+        f(0, out);
+        return;
+    }
+    let chunk = out.len().div_ceil(threads);
+    let mut unspawned = Vec::new();
+    std::thread::scope(|scope| {
+        let f = &f;
+        let mut chunks = out.chunks_mut(chunk).enumerate();
+        let first = chunks.next();
+        for (i, c) in chunks {
+            if std::thread::Builder::new().spawn_scoped(scope, move || f(i * chunk, c)).is_err() {
+                unspawned.push(i);
+            }
+        }
+        if let Some((_, c)) = first {
+            f(0, c);
+        }
+    });
+    for i in unspawned {
+        let start = i * chunk;
+        if let Some(c) = out.get_mut(start..(start + chunk).min(out.len())) {
+            f(start, c);
+        }
+    }
+}
+
+/// Output sample `n` of a resampled channel: the windowed-sinc interpolation of `x` at input
+/// time `n / ratio`.
+fn resample_at(x: &[f32], ratio: f64, table: &SincTable, n: usize) -> f32 {
+    let len = x.len() as i64;
+    let hw = table.half_width;
+    let t = n as f64 / ratio;
+    let lo = (t - hw).ceil().max(0.0) as i64;
+    let hi = ((t + hw).floor() as i64).min(len - 1);
+    let mut acc = 0.0f32;
+    let mut j = lo;
+    while j <= hi {
+        if let Some(&v) = x.get(j as usize) {
+            acc += v * table.at(t - j as f64);
+        }
+        j += 1;
+    }
+    acc
+}
+
 /// Resamples one channel to exactly `out_len` samples, where output sample `n` is read at input
 /// time `n / ratio`.
 fn resample_channel(x: &[f32], ratio: f64, out_len: usize, table: &SincTable) -> Vec<f32> {
-    let len = x.len() as i64;
-    let hw = table.half_width;
-    (0..out_len)
-        .map(|n| {
-            let t = n as f64 / ratio;
-            let lo = (t - hw).ceil().max(0.0) as i64;
-            let hi = ((t + hw).floor() as i64).min(len - 1);
-            let mut acc = 0.0f32;
-            let mut j = lo;
-            while j <= hi {
-                if let Some(&v) = x.get(j as usize) {
-                    acc += v * table.at(t - j as f64);
-                }
-                j += 1;
-            }
-            acc
-        })
-        .collect()
+    let mut out = vec![0.0f32; out_len];
+    fill_parallel(&mut out, |first, chunk| {
+        for (k, o) in chunk.iter_mut().enumerate() {
+            *o = resample_at(x, ratio, table, first + k);
+        }
+    });
+    out
 }
 
 fn resample_ratio(ch: &[Vec<f32>], ratio: f64, out_len: usize) -> Vec<Vec<f32>> {
@@ -604,5 +649,31 @@ mod tests {
         assert_eq!(scaled_len(1000, -1.0), 0);
         assert_eq!(scaled_len(1000, f64::INFINITY), 0);
         assert_eq!(scaled_len(1000, 0.5), 500);
+    }
+
+    #[test]
+    fn parallel_resample_matches_sequential_exactly() {
+        // Long enough to be split across threads (when the machine has more than one core).
+        let x: Vec<f32> = (0..300_000).map(|i| ((i as f32 * 0.013).sin() + (i as f32 * 0.31).cos() * 0.3) * 0.5).collect();
+        let ratio = 48_000.0 / 44_100.0;
+        let out_len = (x.len() as f64 * ratio).round() as usize;
+        let table = SincTable::new(0.97);
+        let par = resample_channel(&x, ratio, out_len, &table);
+        let seq: Vec<f32> = (0..out_len).map(|n| resample_at(&x, ratio, &table, n)).collect();
+        assert_eq!(par.len(), seq.len());
+        assert!(par.iter().zip(&seq).all(|(a, b)| a.to_bits() == b.to_bits()), "parallel output differs");
+    }
+
+    #[test]
+    fn fill_parallel_covers_every_index_once() {
+        for len in [0, 1, 1000, PARALLEL_MIN_CHUNK * 3 + 17] {
+            let mut out = vec![-1.0f32; len];
+            fill_parallel(&mut out, |first, chunk| {
+                for (k, o) in chunk.iter_mut().enumerate() {
+                    *o = (first + k) as f32;
+                }
+            });
+            assert!(out.iter().enumerate().all(|(i, &v)| v == i as f32), "len {len}");
+        }
     }
 }
