@@ -1,10 +1,10 @@
 # State
 
-Last updated: 2026-10-12 (nightly run 2). Based on upstream `acb08ff`.
+Last updated: 2026-10-12 (nightly run 3). Based on upstream `acb08ff`.
 
 ## Review cursor
 
-2026-10-12 run 2: the first full pass of WISHLIST item 1 is complete. Every file in its code areas has been read once (run 2 read the five skimmed areas: `flac.rs` encoder, `offline.rs` time_stretch/detect_transients/non_silent_ranges, `engine/src/io.rs` remaining lines, `cmd/clip_more.rs`, `cmd/file.rs` 1-195). Next pass: re-read after upstream changes (diff `acb08ff..upstream/main` in the item 1 areas), then the mixer's offline render paths (`mix/src/lib.rs` render_range/render_bus/render_clips) and `model/src/clip.rs` stretch handling.
+2026-10-12 run 3: base `acb08ff` (upstream unchanged since run 1, so no re-review of upstream changes was needed). Second pass done for the mixer: `mix/src/lib.rs` read in full except the tests (offline render paths, `sync`, `schedule_notes`, `apply_params`, `build_matrix`/`apply_matrix`) and `model/src/clip.rs` in full. Next: (1) diff `acb08ff..upstream/main` in the item 1 areas; (2) `dsp::pan` (`surround_gains`, `ambisonic_*`, `direction_gains`) and `automation.rs` `value_at`; (3) `playback/src/lib.rs` callback path after upstream PR #210 lands.
 
 ## Open threads
 
@@ -21,7 +21,13 @@ Last updated: 2026-10-12 (nightly run 2). Based on upstream `acb08ff`.
 - **Bounce Stems on web** uses `std::fs` directly (fails in the browser). Low.
 - **Track rename** checks uniqueness before truncating to 64 chars (duplicates possible). Low.
 - **Upstream issues in our areas not fixed by us**: #244 (pan automation stepped per block, so bounce ≠ playback; PR #210 is rewriting that code), #247 (locate keeps plugin tails), #240/#241 (unreachable from the app).
-- **MP3 export (G-21)**: waiting on Ian's choice (see design note).
+- **MP3 export (G-21)**: decided (own encoder). Increments 1-2 on `feat/mp3-export`. **Blocked on the Huffman tables**: the sandbox's safety check refused running a script that converts minimp3's (CC0) decoder tables into encoder tables (see Needs Ian in the run 3 log).
+- **Write automation mode reads old lanes** for pan, sends, mute and plugin parameters (`mix/src/lib.rs` `pan_at`, `send_level`, `apply_params`, auto-mute); only volume ignores its lane in Write. The engine has no automation write pass yet, so what Write should do is an upstream design call. Suspected, medium.
+- **Inserts of the same plugin swapped** are invisible to `sync` (fingerprint hashes ids only), so third-party state blobs stay in the old slot. Suspected, low.
+- **Fade-out off by one** (`model/src/clip.rs` `gain_at`): the last sample of a fade-out is 1/len, not 0; a 1-sample fade-out does nothing. Low (inaudible); changing it moves existing test values.
+- **Clip FX allocations on the audio thread** (`clip_fx_params`, `schedule_notes` RTP lookups): upstream PR #210 fixes the clip-FX part; the MIDI RTP lookups may remain.
+- **MIDI/instrument (low for us)**: first note of a MIDI clip that starts between ticks is missed when playing from the clip start, or fires up to half a tick early (`schedule_notes`, tick rounding); a Mono-format instrument track pans its stereo output to the right (`pan_at` default for index 1).
+- **Render paths, suspected low**: `render_bus` with a latent aux return arrives `lmax_a` late; a stereo source on a mono track keeps only the left channel (`ch % nsrc`); varispeed uses linear interpolation without anti-aliasing; Consolidate keeps clip-FX tails that playback drops.
 
 ## Design notes
 
@@ -39,6 +45,8 @@ Options for Ian:
 3. Ship Opus (in Ogg) for podcast feeds that accept it, MP3 later. Pure-Rust Opus encoders have the same maturity problem; libopus is BSD but C (breaks "pure Rust").
 Licensing note (run 2): minimp3 (lieff/minimp3, C decoder) is CC0 (public domain): its Huffman, scalefactor-band and window tables can be ported into an MIT/Apache crate, and it can serve as a second reference decoder in tests. symphonia's MP3 decoder is MPL-2.0: never copy its tables (using it as a test decoder through the existing dependency is fine).
 Recommendation: option 1, starting with a deliberately simple CBR encoder (no psychoacoustic model, like early encoders) behind `encode(.., FileFormat::Mp3)`, measured with the bench harness and a decoder round-trip test, then improve quality. Upstream PR #159 (ID3v2.4 tagging and chapters) pairs with it.
+
+Run 3 progress: `feat/mp3-export` has the analysis filterbank (polyphase + MDCT + alias reduction; the standard's window reassembled from minimp3's folded copy and verified: a reference decoder back end written from the standard reconstructs the input at 84 dB SNR with the usual 1057-sample delay), the frame header, CBR frame sizes and padding, side info and the quantizer. Still to do: Huffman tables and coding (big_values regions, count1), scalefactors (start with all zero), frame packing with main_data_begin = 0, the symphonia round-trip test, then `encode(.., FileFormat::Mp3)`, bench stage, bit reservoir, Info tag, joint stereo, a psychoacoustic model.
 
 ### G-06 disk streaming (2026-10-12)
 
@@ -125,3 +133,10 @@ All on `iannitram/soundcraft`, based on upstream `acb08ff` unless noted. None ha
 | `fix/bwf-time-reference-resampled` | BWF timestamp not rescaled on import resample | Ready (run 2) |
 | `fix/bundle-size-checked-on-save` | Web bundles over 1 GiB saved but never reopened; missing-source path reuse | Ready (run 2) |
 | `perf/fast-loudness` | B2 loudness meter 4x faster, bit-identical (on top of bench-harness; also adds `loudness_whole` bench stage) | Ready (run 2) |
+| `fix/master-insert-latency` | A Maximizer (or any lookahead plugin) on the Master shifted every bounce late and cut its end | Ready (run 3) |
+| `fix/fades-never-overlap` | Fade-in and fade-out could overlap and dip the middle of a short clip | Ready (run 3); small behaviour change (fades shrink on trim) |
+| `fix/automation-block-independent` | Fader automation skipped breakpoints inside a block; bounce differed from playback | Ready (run 3); touches the same function as upstream PR #210 (possible textual conflict) |
+| `fix/mono-bus-unity-gain` | Mono track to a mono bus lost 3 dB | Ready (run 3); behaviour change, updates an upstream test: needs upstream agreement |
+| `perf/import-resample-memory` | Import resampling frees each input channel as it goes (-24% peak memory) | Ready (run 3); touches `offline.rs` like `perf/parallel-resample` (different functions) |
+| `perf/parallel-wav-decode` | WAV/AIFF decode on all cores, bit-identical (2.6-3.4x) | Ready (run 3) |
+| `feat/mp3-export` | G-21 clean-room MP3 encoder, increments 1-2 (not wired into `encode` yet) | In progress; blocked on Huffman tables |
