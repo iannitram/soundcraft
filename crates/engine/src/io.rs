@@ -30,7 +30,7 @@ fn unique_audio_rel(s: &Session, stem: &str) -> String {
 pub fn add_source(s: &mut Session, name: &str, mut buf: AudioBuffer, path: Option<&str>, format: FileFormat) -> SourceId {
     let sr = s.sample_rate.hz();
     if buf.sample_rate != sr && buf.sample_rate > 0 {
-        buf.channels = soundcraft_dsp::offline::resample(&buf.channels, buf.sample_rate, sr);
+        soundcraft_dsp::offline::resample_in_place(&mut buf.channels, buf.sample_rate, sr);
         buf.sample_rate = sr;
     }
     let id = SourceId(s.alloc());
@@ -737,7 +737,7 @@ pub fn open_session(e: &mut Engine, path: &str) -> Result<Vec<String>> {
 fn load_source_audio(s: &mut Session, id: SourceId, bytes: &[u8], ext: Option<&str>) -> std::result::Result<(), String> {
     let (_, mut buf) = soundcraft_audio_io::decode(bytes, ext).map_err(|err| err.to_string())?;
     if buf.sample_rate != s.sample_rate.hz() && buf.sample_rate > 0 {
-        buf.channels = soundcraft_dsp::offline::resample(&buf.channels, buf.sample_rate, s.sample_rate.hz());
+        soundcraft_dsp::offline::resample_in_place(&mut buf.channels, buf.sample_rate, s.sample_rate.hz());
         buf.sample_rate = s.sample_rate.hz();
     }
     s.pool.insert(id, Arc::new(SourceAudio::new(buf)));
