@@ -18,7 +18,8 @@ use soundcraft_dsp::meter::LoudnessMeter;
 use soundcraft_model::{ChannelFormat, Clip, Session, SourceAudio, SourceId, TrackKind};
 use soundcraft_time::Range;
 
-const STAGES: &[&str] = &["wav_encode", "wav_decode", "flac_encode", "peaks", "stft", "loudness", "eq_render", "bounce", "resample"];
+const STAGES: &[&str] =
+    &["wav_encode", "wav_decode", "flac_encode", "peaks", "stft", "loudness", "loudness_whole", "eq_render", "bounce", "resample"];
 
 struct Args {
     minutes: f64,
@@ -154,6 +155,13 @@ fn main() {
             s = e;
         }
         record("loudness", t.elapsed(), format!("{:.2} LUFS, {:.2} dBTP", m.integrated_lufs(), m.true_peak_db()));
+    }
+    if want("loudness_whole") {
+        // One call over the whole file, as a bounce measures its result.
+        let t = Instant::now();
+        let mut m = LoudnessMeter::new(args.rate as f32, 2);
+        m.process(&buf.channels, frames);
+        record("loudness_whole", t.elapsed(), format!("{:.2} LUFS, {:.2} dBTP", m.integrated_lufs(), m.true_peak_db()));
     }
     if want("eq_render") {
         let mut ch = buf.channels.clone();
