@@ -4,7 +4,7 @@ Our priorities for this fork, in order. **Ian owns this file.** The nightly agen
 
 Use: spoken-word editing (podcast and audiobook voice-over). Long files: 1–3 hours, 48 kHz, often 32-bit float stereo WAV. Formats in and out: WAV, AIFF, MP3. Hardware: AMD Strix Halo laptop (Ryzen AI Max+ 395, 16 cores, full AVX-512, Radeon 8060S, SteamOS, RADV Vulkan, unified memory) and an Apple-Silicon Mac.
 
-*Last changed: 2026-10-12 (answers to the first two runs' "Needs Ian"; see Decisions at the end).*
+*Last changed: 2026-10-12 (after run 3: local work and more decisions; see "Done locally" and Decisions at the end).*
 
 ## 1. Correctness of the crates we'll build on
 
@@ -49,10 +49,21 @@ An Adobe Audition-style Waveform Editor in a new repo, depending on SoundCraft's
 
 Their ranked gaps in `docs/gaps.md`, skipping work that needs real hardware (G-01, G-02, G-03, G-10, G-11, G-12) or an owner decision (G-22).
 
+## Done locally (don't redo)
+
+Daytime sessions on our own machines work in this repo too. Check this list and the fork's branches before starting an item.
+
+- `integration/nightly-2026-10-12`: every branch marked Ready through run 3 (not `perf/max-profile`, not `feat/mp3-export`), merged, plus the two local branches below. The full `cargo xtask ci` passes on it on Windows (709 tests). Never push to it or to `main`; keep basing your branches on `upstream/main` so each one can become a clean upstream PR.
+- `fix/ci-lint-fails-on-windows`: upstream's gate failed on Windows with Rust 1.95 (two clippy errors, a path-string test, the VST3 test fixture's bus-flag type, the late-exit test's order). Fixed, test code and one match guard only.
+- `fix/input-monitoring-latency-creeps`: the open thread "Input monitoring latency creeps to 0.5 s" is fixed (`playback/src/record.rs`, `InputRing` catches up; two tests).
+- **MP3 Huffman tables:** a local session will generate `huffman.rs` and commit it to `feat/mp3-export`. Don't try the conversion in the sandbox again. Until the file is there, do the MP3 parts that don't need it (bit reservoir, Xing/Info tag, wiring behind `encode`, test scaffolding with a decoder round trip), or move on to the next item.
+
 ## Decisions
 
 Answers to "Needs Ian" items, newest first. Don't raise these again unless something changes.
 
+- 2026-10-12, **mono track into a mono bus at unity gain:** keep `fix/mono-bus-unity-gain` on our side; not proposed upstream yet (it stays in the "behaviour change" list with the float-headroom fix).
+- 2026-10-12, **upstream design calls** (Write-mode automation, Delete Fades, the realtime thread pool and the like): write our proposed fix on a branch when it is contained and has a test, as the monitoring-latency one was; otherwise report only.
 - 2026-10-12, **MP3 export (G-21):** option 1, our own clean-room encoder. See item 2.
 - 2026-10-12, **render memory cap:** accepted as `fix/long-render-truncation` has it (2^31 samples on 64-bit targets, 2^29 on 32-bit, a clear error beyond that).
 - 2026-10-12, **float writes keep headroom:** keep `fix/float-writes-keep-headroom` on its branch. Not proposed upstream yet; it stays in the "ready for an upstream PR, behaviour change" list.
