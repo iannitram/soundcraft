@@ -1,6 +1,6 @@
 # State
 
-Last updated: 2026-10-12 (nightly run 1). Based on upstream `acb08ff`.
+Last updated: 2026-10-12 (nightly run 2). Based on upstream `acb08ff`.
 
 ## Review cursor
 
@@ -8,15 +8,20 @@ Last updated: 2026-10-12 (nightly run 1). Based on upstream `acb08ff`.
 
 ## Open threads
 
-- **Delete Fades moves the edit point** (`engine/src/edit.rs` `delete_fades`): trims a crossfade back to its midpoint, not to the original cut, so an asymmetric crossfade's Delete shifts the edit (e.g. 200 samples of take A replace take B). Fix needs the original boundary stored (or each clip shrunk by its own extension). Not fixed: design choice for upstream.
-- **Moving crossfaded clips together destroys the crossfade** (`edit.rs` `move_clips` places one clip at a time via `place_clip`; also `to_playlist`, `clip.loop`). Paste/Duplicate/Repeat fixed on `fix/paste-keeps-crossfades`; the same "clear all, then insert all" approach applies to moves.
-- **Input monitoring latency creeps to 0.5 s** (`playback/src/record.rs` `InputRing`): no target fill level; the backlog only grows (while stopped, on `try_lock` misses, with separate in/out devices). Fix: skip to the newest data when the backlog exceeds a small target. Needs a latency target decision (and real-device testing).
-- **Realtime mixer on rayon's global pool** (`mix/src/lib.rs` `run_strips`, 4+ strips): the audio callback waits on the shared pool, which ProRes decode and offline bounces also use. Upstream PR #210 notes the pool's allocations but not this. Fix: a dedicated pool for realtime rendering. Report to Ian; upstream design decision.
-- **Shuffle-mode Paste/Clear don't ripple automation** (`engine/src/cmd/edit.rs` paste ~236-246, clear ~252-274) while Cut does. Plausible, not yet reproduced.
-- **Trim to File Boundaries** (`cmd/edit.rs` ~597-620) can make a negative start and overlap neighbours. Plausible, not yet reproduced.
-- **BWF timestamps after resampling** (`engine/src/io.rs:71`): `time_reference` is kept in the file's rate when the source is resampled to the session rate; the Edit window adds it to session-rate offsets. Low severity (display/spot of original time). One-line fix: scale by session/file rate.
-- **True-peak over-read** (`dsp/src/meter.rs`): +0.11 dB at 15 kHz/48 kHz, +0.23 dB at 15 kHz/96 kHz (EBU Tech 3341 allows +0.2/-0.4). Low.
-- **MP3 export (G-21)**: see design note; waiting on Ian's choice.
+- **Delete Fades moves the edit point** (`engine/src/edit.rs` `delete_fades`): trims a crossfade back to its midpoint, not the original cut; an asymmetric crossfade's Delete shifts the edit. Needs the original boundary stored. Design choice for upstream.
+- **Input monitoring latency creeps to 0.5 s** (`playback/src/record.rs` `InputRing`): no target fill level. Fix: skip to the newest data when the backlog exceeds a small target. Needs a latency target decision and real-device testing.
+- **Realtime mixer on rayon's global pool** (`mix/src/lib.rs` `run_strips`, 4+ strips): the audio callback waits on the shared pool that offline jobs also use. Fix: a dedicated realtime pool. Upstream design decision.
+- **True-peak over-read** (`dsp/src/meter.rs`): +0.11 dB at 15 kHz/48 kHz, +0.23 dB at 15 kHz/96 kHz (EBU allows +0.2/-0.4). Low. (`perf/fast-loudness` keeps the same filter, bit-identical.)
+- **Stretched clips trim in the wrong units** (`model/src/clip.rs` `trim_start_to` adds a timeline delta to a source offset; `cmd/edit.rs` trims use unscaled offsets): audio slides on any trim of a time-stretched clip. Needs stretch-aware trim in `model`; affects Elastic/TCE users, not plain VO.
+- **Conform to Tempo stale length** (`cmd/clip_more.rs` ~243-252, `clip.len0.{id}` never updated after split/trim). Music feature; low priority for us.
+- **Remove Pitch Shift** refuses clips over 1 h and skips the edit-lock check (`cmd/more_util.rs` ~137-145). Low.
+- **Effects Render on a bypassed clip** deletes its effect settings (`cmd/clip_more.rs` ~207-213). Suspected unintended. Low.
+- **Offline DSP details** (`dsp/src/offline.rs`): `time_stretch` first ~19 samples faded (sample 0 always 0); WSOLA picks the earliest candidate in silence; `detect_transients` uses one global threshold from the loudest flux in the file and can place onsets up to one window early. Low/medium; matters if Strip Silence/transient tools are used on long files.
+- **FLAC encoder**: possible -2^31 residual at 32-bit (spec excludes it); reserves half the PCM size up front (2 GB for 3 h Int32 stereo). Low; FLAC isn't in our formats.
+- **Bounce Stems on web** uses `std::fs` directly (fails in the browser). Low.
+- **Track rename** checks uniqueness before truncating to 64 chars (duplicates possible). Low.
+- **Upstream issues in our areas not fixed by us**: #244 (pan automation stepped per block, so bounce ≠ playback; PR #210 is rewriting that code), #247 (locate keeps plugin tails), #240/#241 (unreachable from the app).
+- **MP3 export (G-21)**: waiting on Ian's choice (see design note).
 
 ## Design notes
 
@@ -32,6 +37,7 @@ Options for Ian:
 1. **Write a clean-room encoder in `audio-io`** (like its FLAC encoder), from ISO/IEC 11172-3 only: polyphase analysis filterbank, MDCT with block switching, Huffman tables and scalefactor bands (factual tables from the standard), CBR with bit reservoir, then a simple psychoacoustic model, then joint stereo and a Xing/LAME-style Info tag for gapless and seeking. Estimate: 3-5 nights to a CBR encoder good enough for speech at 96-128 kbps, more for transparency. Parallel per-frame analysis keeps it fast.
 2. Contribute speed/quality work to `oxideav-mp3` and depend on it (MIT is fine). Less work if the author is active; risky single-maintainer dependency.
 3. Ship Opus (in Ogg) for podcast feeds that accept it, MP3 later. Pure-Rust Opus encoders have the same maturity problem; libopus is BSD but C (breaks "pure Rust").
+Licensing note (run 2): minimp3 (lieff/minimp3, C decoder) is CC0 (public domain): its Huffman, scalefactor-band and window tables can be ported into an MIT/Apache crate, and it can serve as a second reference decoder in tests. symphonia's MP3 decoder is MPL-2.0: never copy its tables (using it as a test decoder through the existing dependency is fine).
 Recommendation: option 1, starting with a deliberately simple CBR encoder (no psychoacoustic model, like early encoders) behind `encode(.., FileFormat::Mp3)`, measured with the bench harness and a decoder round-trip test, then improve quality. Upstream PR #159 (ID3v2.4 tagging and chapters) pairs with it.
 
 ### G-06 disk streaming (2026-10-12)
@@ -45,12 +51,14 @@ Proposed shape (reviewable increments):
 4. **Edits**: destructive edits (Waveform Editor) write new float files (as AudioSuite already does) rather than editing in place, so undo stays a pointer swap.
 5. **Recording to disk**: already streams to a WAV via `TakeWriter`; the take could become a `DiskSource` directly instead of being re-read into RAM.
 Increment 1+2 with a test that a disk source and an in-memory source mix identically is contained (~1 night). The realtime ring (3) needs the Z13 for underrun testing.
+Run 2 check: the mixer reads source audio in exactly one place (`mix/src/lib.rs` `render_clip`, ~1259-1310, which already takes an unused `_scratch` buffer) plus the sampler bridge (~1363-1369); engine reads `audio.buffer` for encoding in 4 places and `health.rs`. So increment 1 (a `SourceAudio::read(ch, start, out)` API used by `render_clip`) is small, but on its own it only adds a copy per block; it pays off only together with increment 2/3 and upstream's PR #43. Not started unreviewed: propose to Ian/upstream first.
 
 ### B0-B2 measurements (2026-10-12, cloud CPU, not the Z13; relative only)
 
 Bench example (`perf/bench-harness`), 60 min synthetic 48 kHz float stereo, `release` profile: wav encode 1.9 s, wav decode 2.1 s, FLAC 24-bit 20.1 s, peaks 0.75 s, STFT (2048/512, mono, `dsp::spectrum::magnitude_db`) 17.8 s, integrated loudness 16.1 s, 7-band EQ render 11.6 s, one-track bounce 7.7 s, 44.1 -> 48 kHz resample 114.7 s.
 - B1 `max` profile (fat LTO, cgu 1): within noise of `release`; no recommendation to use it.
 - B2 resample on scoped threads: 114.7 -> 30.8 s, bit-identical (`perf/parallel-resample`).
+- B2 loudness (run 2, `perf/fast-loudness`): 20 min stereo, whole-file call 5.15 -> 1.26 s, 4096-frame blocks 4.81 -> 2.64 s, bit-identical. Remaining cost: K-weighting biquads ~1.1 s (serial per channel), true peak ~1.5 s. Explicit AVX2/AVX-512 would need `#[target_feature]` + `unsafe` calls, which the crates forbid; stays compiler-vectorised SSE2.
 - Next B2 candidates: FLAC encode (frames are independent: encode in parallel, concatenate in order; identical output), loudness (per-channel K-filter + true-peak in parallel, combine block energies in channel order; identical), and an STFT that reuses its FFT plan (`magnitude_db` builds a new `FftPlanner` per call; no production caller yet, so only matters once a spectrogram exists). Peaks are already fast.
 - AVX-512 SIMD: none of the measured stages is dominated by a loop that would vectorize better by hand except the resampler's sinc dot product (table lookup with linear interpolation per tap prevents auto-vectorization). A polyphase table (precomputed taps per output phase) would let the compiler vectorize and cut work ~2x, but changes output in the last bits: needs an accuracy test instead of bit-identity.
 
@@ -108,3 +116,12 @@ All on `iannitram/soundcraft`, based on upstream `acb08ff` unless noted. None ha
 | `perf/bench-harness` | B0 benchmark example | Ready |
 | `perf/max-profile` | B1 `[profile.max]` (on top of bench-harness) | Measured: no gain; keep for Z13 measurement, not for upstream |
 | `perf/parallel-resample` | B2 resample on scoped threads (on top of bench-harness) | Ready |
+| `fix/long-render-truncation` | Bounce/render/consolidate/commit/export/strip-silence silently cut at ~93 min stereo | Ready (run 2); raises the 64-bit render cap to 2^31 samples |
+| `fix/shuffle-ripples-automation` | Shuffle Clear/Paste left automation behind (upstream #232) | Ready (run 2) |
+| `fix/trim-to-file-stays-in-bounds` | Trim to File Boundaries / Fill Selection overlapped neighbours (upstream #229, #228) | Ready (run 2) |
+| `fix/move-keeps-crossfades` | Moving a crossfaded pair broke the crossfade | Ready (run 2); trivial test-block conflict with `fix/paste-keeps-crossfades` |
+| `fix/unique-take-paths` | Two armed tracks could record into one file | Ready (run 2) |
+| `fix/unique-stem-names` | Stems of clashing track names overwrote each other | Ready (run 2) |
+| `fix/bwf-time-reference-resampled` | BWF timestamp not rescaled on import resample | Ready (run 2) |
+| `fix/bundle-size-checked-on-save` | Web bundles over 1 GiB saved but never reopened; missing-source path reuse | Ready (run 2) |
+| `perf/fast-loudness` | B2 loudness meter 4x faster, bit-identical (on top of bench-harness; also adds `loudness_whole` bench stage) | Ready (run 2) |
