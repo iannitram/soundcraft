@@ -324,7 +324,7 @@ pub fn bounce_stems_with(e: &Engine, dir: &str, r: Range, opts: &EncodeOptions, 
         FileFormat::Flac => "flac",
         _ => "wav",
     };
-    let mut out = Vec::new();
+    let mut out: Vec<String> = Vec::new();
     let stems: Vec<(TrackId, String)> = s
         .tracks
         .iter()
@@ -339,7 +339,12 @@ pub fn bounce_stems_with(e: &Engine, dir: &str, r: Range, opts: &EncodeOptions, 
         let (ch, fmt) = render_main(&solo, r, fold_stereo);
         let buf = AudioBuffer { sample_rate: s.sample_rate.hz(), channels: ch };
         let bytes = soundcraft_audio_io::encode_with_channel_mask(&buf, opts, fmt.channel_mask()).map_err(|err| EngineError::Io(err.to_string()))?;
-        let path = Path::new(dir).join(format!("{} - {}.{ext}", sanitize_name(&s.name), sanitize_name(&name)));
+        // Track names that sanitize alike ("Mic?", "Mic!") or differ only by case must not
+        // overwrite each other's stem.
+        let stem = format!("{} - {}", sanitize_name(&s.name), sanitize_name(&name));
+        let named = |k: u32| Path::new(dir).join(if k < 2 { format!("{stem}.{ext}") } else { format!("{stem} {k}.{ext}") });
+        let used = |p: &Path| out.iter().any(|o| o.to_lowercase() == p.to_string_lossy().to_lowercase());
+        let path = (1..=10_000).map(named).find(|p| !used(p)).unwrap_or_else(|| named(1));
         std::fs::write(&path, bytes).map_err(|err| EngineError::Io(format!("{}: {err}", path.display())))?;
         out.push(path.to_string_lossy().into_owned());
     }
@@ -1266,6 +1271,21 @@ mod stem_tests {
             .unwrap();
         let n = r["files"].as_array().map_or(0, Vec::len);
         assert_eq!(n, 7, "{r}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stems_of_tracks_with_clashing_names_get_their_own_files() {
+        let mut e = crate::Engine::default();
+        for name in ["Mic?", "Mic!", "mic_"] {
+            e.execute("track.new", &serde_json::json!({"name": name, "format": "mono"})).unwrap();
+        }
+        let dir = std::env::temp_dir().join(format!("soundcraft-stem-names-{}", std::process::id()));
+        let r = e.execute("file.bounce_stems", &serde_json::json!({"dir": dir.to_string_lossy(), "start": 0, "end": 4800})).unwrap();
+        let files: Vec<String> = r["files"].as_array().unwrap().iter().filter_map(|f| f.as_str().map(str::to_owned)).collect();
+        let distinct: std::collections::HashSet<_> = files.iter().map(|f| f.to_lowercase()).collect();
+        assert_eq!((files.len(), distinct.len()), (3, 3), "{r}");
+        assert!(files.iter().all(|f| std::path::Path::new(f).exists()), "{r}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
