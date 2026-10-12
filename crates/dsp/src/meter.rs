@@ -136,6 +136,75 @@ const HIST_BINS: usize = 1800; // -70 .. +20 LUFS
 const TP_PHASES: usize = 4;
 const TP_TAPS: usize = 12;
 
+/// Frames per call above which [`LoudnessMeter::process`] measures channels on their own threads
+/// (offline only: a realtime block is far smaller).
+const PARALLEL_MIN_FRAMES: usize = 1 << 16;
+
+/// One channel's share of a threaded [`LoudnessMeter::process`] call.
+struct ChannelRun<'a> {
+    filters: [Biquad; 2],
+    acc: f64,
+    hist: [f32; TP_TAPS],
+    peak: f32,
+    /// Energy of each sub-block completed during the call.
+    blocks: Vec<f64>,
+    input: &'a [f32],
+}
+
+/// Runs `x` through the K-weighting filters and adds the squared output to `acc`, sample by
+/// sample in order (so the f64 sum is the same as one sample at a time).
+fn k_weighted_energy(f: &mut [Biquad; 2], x: &[f32], mut acc: f64) -> f64 {
+    let [f1, f2] = f;
+    for &v in x {
+        let v = if v.is_finite() { v } else { 0.0 };
+        let y = f2.process_sample(f1.process_sample(v));
+        acc += f64::from(y) * f64::from(y);
+    }
+    acc
+}
+
+/// Highest sample or 4x-interpolated peak over `x`, continuing the interpolator history `h`
+/// (`h[k]` is the input `k` samples ago). Each phase sums its taps in the same order as a
+/// sample-at-a-time loop.
+fn true_peak_run(coefs: &[[f32; TP_TAPS]; TP_PHASES], h: &mut [f32; TP_TAPS], x: &[f32]) -> f32 {
+    const CHUNK: usize = 256;
+    // `buf[i]` holds the input at chunk time `i - (TP_TAPS - 1)`: history first, oldest first.
+    let mut buf = [0.0f32; CHUNK + TP_TAPS - 1];
+    let mut peak = 0.0f32;
+    for part in x.chunks(CHUNK) {
+        for (d, s) in buf.iter_mut().zip(h.iter().rev()) {
+            *d = *s;
+        }
+        for (d, &v) in buf.iter_mut().skip(TP_TAPS - 1).zip(part) {
+            *d = if v.is_finite() { v } else { 0.0 };
+        }
+        let n = part.len();
+        for v in buf.iter().skip(TP_TAPS - 1).take(n) {
+            peak = peak.max(v.abs());
+        }
+        // Each phase is a 12-tap FIR. Looping over time inside each tap keeps every output's
+        // sum in tap order (bit-identical to a per-sample loop) and vectorizes across samples.
+        for ph in coefs {
+            let mut y = [0.0f32; CHUNK];
+            for (k, &c) in ph.iter().enumerate() {
+                let Some(src) = buf.get(TP_TAPS - 1 - k..TP_TAPS - 1 - k + n) else { continue };
+                for (o, &v) in y.iter_mut().zip(src) {
+                    *o += c * v;
+                }
+            }
+            for o in y.iter().take(n) {
+                peak = peak.max(o.abs());
+            }
+        }
+        // New history: the last TP_TAPS inputs, newest first.
+        let end = TP_TAPS - 1 + part.len();
+        for (k, d) in h.iter_mut().enumerate() {
+            *d = end.checked_sub(1 + k).and_then(|i| buf.get(i)).copied().unwrap_or(0.0);
+        }
+    }
+    peak
+}
+
 /// ITU-R BS.1770 / EBU R128 loudness meter.
 #[derive(Debug, Clone)]
 pub struct LoudnessMeter {
@@ -261,39 +330,104 @@ impl LoudnessMeter {
     }
 
     /// Feeds planar audio. Channels beyond the meter's channel count are ignored.
+    ///
+    /// Channels are independent until each 100 ms sub-block is summed, so they are processed one
+    /// at a time (and, for long offline inputs, on their own threads) and combined in channel
+    /// order: the result is bit-identical to feeding the samples one frame at a time.
     pub fn process(&mut self, io: &[Vec<f32>], frames: usize) {
         let ch = self.filters.len().min(io.len());
         let frames = io.iter().take(ch).map(Vec::len).fold(frames, usize::min);
-        for n in 0..frames {
+        if ch >= 2 && frames >= PARALLEL_MIN_FRAMES && self.process_parallel(io, ch, frames) {
+            return;
+        }
+        let mut n = 0;
+        while n < frames {
+            // Up to the end of the current sub-block.
+            let len = (self.block_len - self.block_pos).min(frames - n);
             for c in 0..ch {
-                let x = io.get(c).and_then(|b| b.get(n)).copied().filter(|v| v.is_finite()).unwrap_or(0.0);
-                if let Some([f1, f2]) = self.filters.get_mut(c) {
-                    let y = f2.process_sample(f1.process_sample(x));
-                    if let Some(acc) = self.block_acc.get_mut(c) {
-                        *acc += f64::from(y) * f64::from(y);
-                    }
-                }
-                self.true_peak_sample(c, x);
+                let Some(x) = io.get(c).and_then(|b| b.get(n..n + len)) else { continue };
+                let (Some(f), Some(acc), Some(h)) = (self.filters.get_mut(c), self.block_acc.get_mut(c), self.tp_hist.get_mut(c)) else { continue };
+                *acc = k_weighted_energy(f, x, *acc);
+                self.true_peak = self.true_peak.max(true_peak_run(&self.tp_coefs, h, x));
             }
-            self.block_pos += 1;
+            n += len;
+            self.block_pos += len;
             if self.block_pos >= self.block_len {
                 self.finish_sub_block();
             }
         }
     }
 
-    fn true_peak_sample(&mut self, c: usize, x: f32) {
-        let Some(h) = self.tp_hist.get_mut(c) else { return };
-        h.copy_within(0..TP_TAPS - 1, 1);
-        h[0] = x;
-        let mut peak = x.abs();
-        for ph in &self.tp_coefs {
-            let y: f32 = ph.iter().zip(h.iter()).map(|(a, b)| a * b).sum();
-            peak = peak.max(y.abs());
+    /// [`Self::process`] with one scoped thread per channel: each returns its energy per
+    /// completed sub-block, combined here in channel order. False (nothing consumed) when
+    /// threads are unavailable (wasm, a failed spawn).
+    fn process_parallel(&mut self, io: &[Vec<f32>], ch: usize, frames: usize) -> bool {
+        let (block_len, block_pos) = (self.block_len, self.block_pos);
+        let coefs = self.tp_coefs;
+        let mut work: Vec<_> = self
+            .filters
+            .iter()
+            .zip(&self.block_acc)
+            .zip(&self.tp_hist)
+            .zip(io)
+            .take(ch)
+            .map(|(((f, acc), h), x)| ChannelRun {
+                filters: *f,
+                acc: *acc,
+                hist: *h,
+                peak: 0.0,
+                blocks: Vec::new(),
+                input: x.get(..frames).unwrap_or_default(),
+            })
+            .collect();
+        let run = |w: &mut ChannelRun| {
+            let mut pos = block_pos;
+            let mut n = 0;
+            while n < w.input.len() {
+                let len = (block_len - pos).min(w.input.len() - n);
+                let Some(x) = w.input.get(n..n + len) else { break };
+                w.acc = k_weighted_energy(&mut w.filters, x, w.acc);
+                w.peak = w.peak.max(true_peak_run(&coefs, &mut w.hist, x));
+                n += len;
+                pos += len;
+                if pos >= block_len {
+                    w.blocks.push(w.acc);
+                    w.acc = 0.0;
+                    pos = 0;
+                }
+            }
+        };
+        let spawned = std::thread::scope(|scope| {
+            let mut rest = work.iter_mut();
+            let first = rest.next();
+            let handles: Vec<_> = rest.map(|w| std::thread::Builder::new().spawn_scoped(scope, || run(w))).collect();
+            if let Some(w) = first {
+                run(w);
+            }
+            let joined: Vec<bool> = handles.into_iter().map(|h| h.is_ok_and(|h| h.join().is_ok())).collect();
+            joined.into_iter().all(|ok| ok)
+        });
+        if !spawned {
+            return false;
         }
-        if peak > self.true_peak {
-            self.true_peak = peak;
+        let blocks = work.first().map_or(0, |w| w.blocks.len());
+        for i in 0..blocks {
+            for (acc, w) in self.block_acc.iter_mut().zip(&work) {
+                *acc = w.blocks.get(i).copied().unwrap_or(0.0);
+            }
+            self.block_pos = block_len;
+            self.finish_sub_block();
         }
+        for (c, w) in work.into_iter().enumerate() {
+            if let (Some(f), Some(acc), Some(h)) = (self.filters.get_mut(c), self.block_acc.get_mut(c), self.tp_hist.get_mut(c)) {
+                *f = w.filters;
+                *acc = w.acc;
+                *h = w.hist;
+            }
+            self.true_peak = self.true_peak.max(w.peak);
+        }
+        self.block_pos = (block_pos + frames) % block_len;
+        true
     }
 
     fn finish_sub_block(&mut self) {
@@ -377,5 +511,117 @@ impl LoudnessMeter {
     /// Maximum true peak (4× oversampled) in dBTP.
     pub fn true_peak_db(&self) -> f32 {
         gain_to_db(self.true_peak)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The meter as it was written before the channel-major rewrite: one frame at a time.
+    fn reference(m: &mut LoudnessMeter, io: &[Vec<f32>], frames: usize) {
+        let ch = m.filters.len().min(io.len());
+        let frames = io.iter().take(ch).map(Vec::len).fold(frames, usize::min);
+        for n in 0..frames {
+            for c in 0..ch {
+                let x = io.get(c).and_then(|b| b.get(n)).copied().filter(|v| v.is_finite()).unwrap_or(0.0);
+                if let Some([f1, f2]) = m.filters.get_mut(c) {
+                    let y = f2.process_sample(f1.process_sample(x));
+                    if let Some(acc) = m.block_acc.get_mut(c) {
+                        *acc += f64::from(y) * f64::from(y);
+                    }
+                }
+                if let Some(h) = m.tp_hist.get_mut(c) {
+                    h.copy_within(0..TP_TAPS - 1, 1);
+                    h[0] = x;
+                    let mut peak = x.abs();
+                    for ph in &m.tp_coefs {
+                        let y: f32 = ph.iter().zip(h.iter()).map(|(a, b)| a * b).sum();
+                        peak = peak.max(y.abs());
+                    }
+                    if peak > m.true_peak {
+                        m.true_peak = peak;
+                    }
+                }
+            }
+            m.block_pos += 1;
+            if m.block_pos >= m.block_len {
+                m.finish_sub_block();
+            }
+        }
+    }
+
+    fn signal(channels: usize, frames: usize) -> Vec<Vec<f32>> {
+        let mut seed = 0x2545_f491_u32;
+        (0..channels)
+            .map(|c| {
+                (0..frames)
+                    .map(|i| {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 17;
+                        seed ^= seed << 5;
+                        let noise = (seed as f32 / u32::MAX as f32 - 0.5) * 0.2;
+                        let speech = (i as f32 * (0.03 + c as f32 * 0.011)).sin() * (0.5 + 0.45 * (i as f32 * 1.3e-4).sin());
+                        if i == 7_777 {
+                            f32::NAN
+                        } else if i == 9_999 {
+                            f32::INFINITY
+                        } else {
+                            speech + noise
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn readings(m: &LoudnessMeter) -> [u32; 5] {
+        [m.integrated_lufs(), m.momentary_lufs(), m.short_term_lufs(), m.max_momentary_lufs(), m.true_peak_db()].map(f32::to_bits)
+    }
+
+    fn state(m: &LoudnessMeter) -> (Vec<u64>, Vec<u64>, usize, Vec<[u32; TP_TAPS]>) {
+        (
+            m.block_acc.iter().map(|v| v.to_bits()).collect(),
+            m.hist_energy.iter().map(|v| v.to_bits()).collect(),
+            m.block_pos,
+            m.tp_hist.iter().map(|h| h.map(f32::to_bits)).collect(),
+        )
+    }
+
+    #[test]
+    fn matches_the_frame_at_a_time_meter_bit_for_bit() {
+        for (sr, channels) in [(48_000.0, 2), (44_100.0, 1), (96_000.0, 6)] {
+            let x = signal(channels, 300_007);
+            let mut want = LoudnessMeter::new(sr, channels);
+            reference(&mut want, &x, 300_007);
+            // One long call (threaded), and uneven small blocks (sequential).
+            let mut whole = LoudnessMeter::new(sr, channels);
+            whole.process(&x, 300_007);
+            assert_eq!((readings(&whole), state(&whole)), (readings(&want), state(&want)), "whole, {sr} Hz x{channels}");
+            let mut blocks = LoudnessMeter::new(sr, channels);
+            let mut at = 0;
+            for len in [1, 17, 4096, 70_000, 513].into_iter().cycle() {
+                if at >= 300_007 {
+                    break;
+                }
+                let end = (at + len).min(300_007);
+                let part: Vec<Vec<f32>> = x.iter().map(|c| c[at..end].to_vec()).collect();
+                blocks.process(&part, end - at);
+                at = end;
+            }
+            assert_eq!((readings(&blocks), state(&blocks)), (readings(&want), state(&want)), "blocks, {sr} Hz x{channels}");
+        }
+    }
+
+    #[test]
+    fn short_and_mismatched_inputs_are_safe() {
+        let mut m = LoudnessMeter::new(48_000.0, 2);
+        m.process(&[], 100);
+        m.process(&[vec![0.5; 10]], 1_000);
+        m.process(&[vec![0.5; 100_000], vec![0.5; 70_000]], 200_000);
+        let mut r = LoudnessMeter::new(48_000.0, 2);
+        reference(&mut r, &[vec![0.5; 10]], 1_000);
+        reference(&mut r, &[vec![0.5; 100_000], vec![0.5; 70_000]], 200_000);
+        assert_eq!(readings(&m), readings(&r));
     }
 }
