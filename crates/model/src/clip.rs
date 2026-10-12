@@ -215,7 +215,16 @@ impl Clip {
         self.length -= delta;
         self.start = new_start;
         self.clamp_fades();
-        self.gain_env = self.gain_env.iter().filter_map(|&(t, v)| (t - delta >= 0).then_some((t - delta, v))).collect();
+        // Points before the new start fall off; keep the envelope's value there as a point at 0 so
+        // the kept material plays at the same gain as before.
+        let carried = (delta > 0 && self.gain_env.first().is_some_and(|&(t, _)| t < delta)).then(|| env_value(&self.gain_env, delta));
+        let mut env: Vec<(Samples, f32)> = self.gain_env.iter().filter_map(|&(t, v)| (t - delta >= 0).then_some((t - delta, v))).collect();
+        if let Some(v) = carried
+            && env.first().is_none_or(|&(t, _)| t > 0)
+        {
+            env.insert(0, (0, v));
+        }
+        self.gain_env = env;
     }
 
     /// Move the end edge to `new_end`.
@@ -253,6 +262,32 @@ pub(crate) fn db_to_gain(db: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trimming_the_start_keeps_the_gain_envelope() {
+        // A ramp from 0 dB to -20 dB; splitting at 500 must not change what the right half plays.
+        let mut c = Clip::audio(ClipId(1), "a", SourceId(1), 0, 0, 1000);
+        c.gain_env = vec![(0, 0.0), (1000, -20.0)];
+        let before: Vec<f32> = (500..1000).step_by(50).map(|t| c.gain_at(t)).collect();
+        c.trim_start_to(500);
+        let after: Vec<f32> = (0..500).step_by(50).map(|t| c.gain_at(t)).collect();
+        for (b, a) in before.iter().zip(&after) {
+            assert!((b - a).abs() < 1e-5, "{before:?} vs {after:?}");
+        }
+        assert_eq!(c.gain_env.first(), Some(&(0, -10.0)));
+
+        // Every point before the new start: the last value holds.
+        let mut c = Clip::audio(ClipId(1), "a", SourceId(1), 0, 0, 1000);
+        c.gain_env = vec![(0, 0.0), (100, -12.0)];
+        c.trim_start_to(400);
+        assert!((c.gain_at(0) - db_to_gain(-12.0)).abs() < 1e-6);
+
+        // A point exactly at the new start is kept as is, not duplicated.
+        let mut c = Clip::audio(ClipId(1), "a", SourceId(1), 0, 0, 1000);
+        c.gain_env = vec![(0, 0.0), (500, -6.0), (1000, 0.0)];
+        c.trim_start_to(500);
+        assert_eq!(c.gain_env, vec![(0, -6.0), (500, 0.0)]);
+    }
 
     #[test]
     fn fade_shapes_hit_endpoints() {
