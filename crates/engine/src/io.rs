@@ -54,6 +54,15 @@ pub fn add_source(s: &mut Session, name: &str, mut buf: AudioBuffer, path: Optio
     id
 }
 
+/// A sample count at rate `from` expressed at rate `to` (rounded; unchanged if either is 0).
+fn rescale_samples(n: u64, from: u32, to: u32) -> u64 {
+    if from == to || from == 0 || to == 0 {
+        return n;
+    }
+    let (from, to) = (u128::from(from), u128::from(to));
+    u64::try_from((u128::from(n) * to + from / 2) / from).unwrap_or(u64::MAX)
+}
+
 /// Decode and place an audio file. With no target track, a new track of matching width is made.
 pub fn import_audio_bytes(e: &mut Engine, name: &str, bytes: &[u8], path: Option<&str>, target: Option<TrackId>, at: Samples) -> Result<Value> {
     let ext = Path::new(name).extension().and_then(|x| x.to_str()).map(str::to_ascii_lowercase);
@@ -65,10 +74,12 @@ pub fn import_audio_bytes(e: &mut Engine, name: &str, bytes: &[u8], path: Option
         return Err(EngineError::Io(format!("{name}: no audio")));
     }
     let channels = buf.num_channels();
+    let file_rate = buf.sample_rate;
     let s = e.session_mut();
     let src = add_source(s, name, buf, path, info.format);
     if let (Some(bwf), Some(sx)) = (info.bwf.as_ref(), s.sources.last_mut()) {
-        sx.time_reference = bwf.time_reference;
+        // The source is now at the session rate; so is everything the timestamp is added to.
+        sx.time_reference = rescale_samples(bwf.time_reference, file_rate, sx.sample_rate);
     }
     let frames = s.source(src).map_or(0, |x| i64::try_from(x.frames).unwrap_or(0));
     let track = match target {
@@ -1298,5 +1309,36 @@ mod bundle_tests {
         write_file(&p.to_string_lossy(), b"hello").unwrap();
         assert_eq!(std::fs::read(&p).unwrap(), b"hello");
         let _ = std::fs::remove_file(&p);
+    }
+}
+
+#[cfg(test)]
+mod bwf_import_tests {
+    use super::*;
+
+    fn bwf_wav(rate: u32, time_reference: u64) -> Vec<u8> {
+        let buf = AudioBuffer { sample_rate: rate, channels: vec![vec![0.25; 4410]] };
+        let bwf = soundcraft_audio_io::BwfInfo { time_reference, ..Default::default() };
+        soundcraft_audio_io::encode(&buf, &EncodeOptions { bwf: Some(bwf), ..EncodeOptions::default() }).unwrap()
+    }
+
+    #[test]
+    fn bwf_timestamp_follows_the_import_resample() {
+        // 10:00:00 at 44.1 kHz imported into a 48 kHz session is 10:00:00 at 48 kHz.
+        let mut e = Engine::default();
+        assert_eq!(e.session().sample_rate.hz(), 48_000);
+        import_audio_bytes(&mut e, "a.wav", &bwf_wav(44_100, 44_100 * 36_000), None, None, 0).unwrap();
+        assert_eq!(e.session().sources.last().unwrap().time_reference, 48_000 * 36_000);
+        // Same rate: unchanged.
+        import_audio_bytes(&mut e, "b.wav", &bwf_wav(48_000, 12_345), None, None, 0).unwrap();
+        assert_eq!(e.session().sources.last().unwrap().time_reference, 12_345);
+    }
+
+    #[test]
+    fn rescale_rounds_and_saturates() {
+        assert_eq!(rescale_samples(1, 44_100, 48_000), 1);
+        assert_eq!(rescale_samples(441, 44_100, 48_000), 480);
+        assert_eq!(rescale_samples(u64::MAX, 1, 2), u64::MAX);
+        assert_eq!(rescale_samples(7, 0, 48_000), 7);
     }
 }
