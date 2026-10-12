@@ -319,6 +319,13 @@ fn resample_ratio(ch: &[Vec<f32>], ratio: f64, out_len: usize) -> Vec<Vec<f32>> 
     ch.iter().map(|c| resample_channel(c, ratio, out_len, &table)).collect()
 }
 
+/// Output length of a `len`-sample channel resampled by `ratio`. [`resample`] and
+/// [`resample_in_place`] both take it from here, so the two can't come to cap long files
+/// differently.
+fn resampled_len(len: usize, ratio: f64) -> usize {
+    scaled_len(len, ratio)
+}
+
 /// High-quality windowed-sinc sample-rate conversion from `from` Hz to `to` Hz.
 pub fn resample(ch: &[Vec<f32>], from: u32, to: u32) -> Vec<Vec<f32>> {
     if from == 0 || to == 0 || from == to {
@@ -327,7 +334,7 @@ pub fn resample(ch: &[Vec<f32>], from: u32, to: u32) -> Vec<Vec<f32>> {
     let ratio = f64::from(to) / f64::from(from);
     ch.iter()
         .map(|c| {
-            let out_len = scaled_len(c.len(), ratio);
+            let out_len = resampled_len(c.len(), ratio);
             resample_ratio(std::slice::from_ref(c), ratio, out_len).into_iter().next().unwrap_or_default()
         })
         .collect()
@@ -343,7 +350,7 @@ pub fn resample_in_place(ch: &mut [Vec<f32>], from: u32, to: u32) {
     }
     let ratio = f64::from(to) / f64::from(from);
     for c in ch.iter_mut() {
-        let out_len = ((c.len() as f64 * ratio).round() as usize).min(MAX_OFFLINE_SAMPLES);
+        let out_len = resampled_len(c.len(), ratio);
         let out = resample_ratio(std::slice::from_ref(c), ratio, out_len).into_iter().next().unwrap_or_default();
         *c = out;
     }
@@ -662,6 +669,16 @@ pub fn peak_db(ch: &[Vec<f32>]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: merged with the long-file fix, the in-place resample that imports use still
+    /// stopped at the short-clip cap (93 minutes at 48 kHz).
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn both_resamplers_keep_all_of_a_long_file() {
+        let two_hours = 44_100 * 7_200;
+        assert_eq!(resampled_len(two_hours, 48_000.0 / 44_100.0), 48_000 * 7_200);
+        assert!(resampled_len(two_hours, 48_000.0 / 44_100.0) > MAX_OFFLINE_SAMPLES);
+    }
 
     #[test]
     fn resample_in_place_matches_resample() {
