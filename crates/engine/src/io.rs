@@ -824,9 +824,26 @@ pub fn session_bundle(session: &Session) -> Result<(Vec<u8>, Session)> {
     let zerr = |err: zip::result::ZipError| EngineError::Io(format!("bundle: {err}"));
     let ioerr = |err: std::io::Error| EngineError::Io(format!("bundle: {err}"));
     let mut s = session.clone();
+    // Refuse up front what `read_bundle` would refuse to open: a save that looks fine but never
+    // reopens loses the work. Audio is stored as 32-bit float WAV (4 bytes per sample).
+    let audio_bytes: u64 = s
+        .sources
+        .iter()
+        .filter(|x| s.pool.get(x.id).is_some())
+        .map(|x| x.frames.saturating_mul(u64::from(x.channels)).saturating_mul(4).saturating_add(4096))
+        .fold(0, u64::saturating_add);
+    if audio_bytes > MAX_BUNDLE_BYTES {
+        return Err(EngineError::Unsupported(format!(
+            "bundle: the session's audio needs {} MB, more than a bundle can hold ({} MB, about 46 minutes of 48 kHz stereo)",
+            audio_bytes >> 20,
+            MAX_BUNDLE_BYTES >> 20
+        )));
+    }
     let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored).large_file(true);
-    let mut taken = std::collections::HashSet::new();
+    // Sources whose audio is missing keep their old path; never hand that file name to another
+    // source, or reopening loads its audio into the missing one.
+    let mut taken: std::collections::HashSet<String> = s.sources.iter().filter(|x| s.pool.get(x.id).is_none()).map(|x| x.path.clone()).collect();
     for src in &mut s.sources {
         let Some(audio) = s.pool.get(src.id) else { continue };
         let base = sanitize_name(&src.name);
@@ -1323,6 +1340,36 @@ mod bundle_tests {
         }
         assert!(!r.is_dirty());
         assert_eq!(r.path.as_deref(), Some("Midnight Groove.scraftz"));
+    }
+
+    #[test]
+    fn a_bundle_too_big_to_reopen_is_refused_on_save() {
+        let mut e = crate::demo::demo_engine();
+        let s = e.session_mut();
+        // A 47-minute 48 kHz stereo source: 1.08 GB as float WAV.
+        s.sources[0].channels = 2;
+        s.sources[0].frames = 48_000 * 60 * 47;
+        assert!(matches!(session_bundle(e.session()), Err(EngineError::Unsupported(_))));
+        e.session_mut().sources[0].frames = 48_000 * 60 * 40;
+        assert!(session_bundle(e.session()).is_ok());
+    }
+
+    #[test]
+    fn a_missing_sources_path_is_not_reused_for_another_source() {
+        let mut e = crate::demo::demo_engine();
+        let s = e.session_mut();
+        // Source 0 was reported missing on open; source 1 has the same name and real audio.
+        let (missing, present) = (s.sources[0].id, s.sources[1].id);
+        s.sources[0].path = "Audio Files/Take.wav".into();
+        s.sources[1].name = "Take".into();
+        s.pool.remove(missing);
+        let (bytes, fresh) = session_bundle(e.session()).unwrap();
+        let path_of = |id| fresh.sources.iter().find(|x| x.id == id).map(|x| x.path.clone()).unwrap();
+        assert_ne!(path_of(present), path_of(missing));
+        let mut r = Engine::default();
+        let lost = open_session_bytes(&mut r, "x.scraftz", &bytes).unwrap();
+        assert!(r.session().pool.get(present).is_some(), "{lost:?}");
+        assert!(r.session().pool.get(missing).is_none());
     }
 
     #[test]
