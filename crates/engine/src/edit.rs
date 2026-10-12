@@ -349,14 +349,18 @@ pub fn create_fades(s: &mut Session, track: TrackId, range: Range, shape: FadeSh
             // Extend each clip into the other's territory using its handles.
             let ext_a = after.min(a_handle).max(0);
             let ext_b = before.min(b_handle).max(0);
+            // With handles, both fades span the overlap the handles allow, so the two clips
+            // overlap exactly and the crossfade has no gap. Without any, each clip fades to
+            // silence at the cut over its side of the selection.
+            let (out_len, in_len) = if ext_a + ext_b > 0 { (ext_a + ext_b, ext_a + ext_b) } else { (before, after) };
             if let Some(ca) = pl.clips.get_mut(i) {
                 ca.length += ext_a;
-                ca.fade_out = Fade { len: (ext_a + before).min(ca.length), shape };
+                ca.fade_out = Fade { len: out_len.min(ca.length), shape };
             }
             if let Some(cb) = pl.clips.get_mut(i + 1) {
                 let old = cb.start;
                 cb.trim_start_to(old - ext_b);
-                cb.fade_in = Fade { len: (ext_b + after).min(cb.length), shape };
+                cb.fade_in = Fade { len: in_len.min(cb.length), shape };
             }
             made += 1;
             xfaded.push(a.id);
@@ -523,6 +527,27 @@ mod tests {
         delete_fades(&mut s, t, Range::new(2900, 3100));
         let c = s.track(t).unwrap().clips();
         assert_eq!((c[0].end(), c[1].start), (3000, 3000));
+    }
+
+    #[test]
+    fn crossfade_without_handles_on_one_side_has_no_dip() {
+        // Clip b starts at the very beginning of its file, so it has no handle to extend left:
+        // the crossfade must happen after the cut, with both fades over the same span.
+        let (mut s, t) = session_with_clip();
+        separate_at(&mut s, t, 3000);
+        if let Some(b) = s.track_mut(t).and_then(|t| t.playlist_mut()).and_then(|p| p.clips.get_mut(1)) {
+            b.content = ClipContent::Audio { source: SourceId(500), offset: 0 };
+        }
+        assert_eq!(create_fades(&mut s, t, Range::new(2900, 3100), FadeShape::Linear), 1);
+        let c = s.track(t).unwrap().clips().to_vec();
+        assert_eq!((c[0].end(), c[1].start), (3100, 3000));
+        assert_eq!((c[0].fade_out.len, c[1].fade_in.len), (100, 100));
+        // A linear crossfade sums to unity everywhere.
+        let gain = |c: &Clip, at: Samples| if c.range().contains(at) { c.gain_at(at - c.start) } else { 0.0 };
+        for at in 2800..3200 {
+            let sum = gain(&c[0], at) + gain(&c[1], at);
+            assert!((sum - 1.0).abs() < 0.02, "gain {sum} at {at}");
+        }
     }
 
     #[test]
