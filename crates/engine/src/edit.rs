@@ -348,12 +348,12 @@ pub fn create_fades(s: &mut Session, track: TrackId, range: Range, shape: FadeSh
             let ext_b = before.min(b_handle).max(0);
             if let Some(ca) = pl.clips.get_mut(i) {
                 ca.length += ext_a;
-                ca.fade_out = Fade { len: (ext_a + before).min(ca.length), shape };
+                ca.set_fade_out(Fade { len: (ext_a + before).min(ca.length), shape });
             }
             if let Some(cb) = pl.clips.get_mut(i + 1) {
                 let old = cb.start;
                 cb.trim_start_to(old - ext_b);
-                cb.fade_in = Fade { len: (ext_b + after).min(cb.length), shape };
+                cb.set_fade_in(Fade { len: (ext_b + after).min(cb.length), shape });
             }
             made += 1;
             xfaded.push(a.id);
@@ -362,10 +362,10 @@ pub fn create_fades(s: &mut Session, track: TrackId, range: Range, shape: FadeSh
     }
     for c in pl.clips.iter_mut().filter(|c| !xfaded.contains(&c.id)) {
         if range.start <= c.start && range.end > c.start && range.end < c.end() {
-            c.fade_in = Fade { len: range.end - c.start, shape };
+            c.set_fade_in(Fade { len: range.end - c.start, shape });
             made += 1;
         } else if range.end >= c.end() && range.start > c.start && range.start < c.end() {
-            c.fade_out = Fade { len: c.end() - range.start, shape };
+            c.set_fade_out(Fade { len: c.end() - range.start, shape });
             made += 1;
         }
     }
@@ -498,6 +498,14 @@ mod tests {
         delete_fades(&mut s, t, Range::new(2900, 3100));
         let c = s.track(t).unwrap().clips();
         assert_eq!((c[0].end(), c[1].start), (3000, 3000));
+        // Regression: a fade-in over most of a clip with a fade-out used to overlap it.
+        let (mut s, t) = session_with_clip();
+        let c = s.track(t).unwrap().clips()[0].clone();
+        assert_eq!(create_fades(&mut s, t, Range::new(c.start + 1000, c.end() + 10), FadeShape::Linear), 1);
+        assert_eq!(create_fades(&mut s, t, Range::new(c.start - 10, c.end() - 500), FadeShape::Linear), 1);
+        let c = &s.track(t).unwrap().clips()[0];
+        assert_eq!(c.fade_in.len, c.length - 500);
+        assert_eq!(c.fade_out.len, 500);
     }
 
     #[test]
