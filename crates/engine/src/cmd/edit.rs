@@ -614,8 +614,9 @@ fn trim_edge(e: &mut Engine, p: &Value, start: bool) -> Result<Value> {
 fn room_for(s: &Session, id: ClipId) -> (Samples, Samples) {
     let Some((t, c)) = s.find_clip(id) else { return (0, Samples::MAX) };
     let others = || s.track(t).into_iter().flat_map(|tr| tr.clips().iter()).filter(|o| o.id != id);
-    let lo = others().filter(|o| o.start < c.start).map(soundcraft_model::Clip::end).filter(|&e| e <= c.start).max().unwrap_or(0);
-    let hi = others().filter(|o| o.end() > c.end()).map(|o| o.start).filter(|&st| st >= c.end()).min().unwrap_or(Samples::MAX);
+    // A neighbour that already reaches into the clip (a crossfade) leaves no room on that side.
+    let lo = others().filter(|o| o.start < c.start).map(|o| o.end().min(c.start)).max().unwrap_or(0);
+    let hi = others().filter(|o| o.end() > c.end()).map(|o| o.start.max(c.end())).min().unwrap_or(Samples::MAX);
     (lo.max(0), hi)
 }
 
@@ -907,6 +908,20 @@ mod tests {
         e.execute("edit.trim_to_file_boundaries", &json!({"clips": [b.0]})).unwrap();
         // Alone, B would start 48 000 before the timeline; it stops at 0.
         assert_eq!(ranges(&e, t), vec![(0, 432_000, 48_000)]);
+    }
+
+    /// Regression: a neighbour that overlaps the clip (every crossfade is one) was not counted
+    /// as a neighbour at all, so the clip grew straight across it.
+    #[test]
+    fn trim_to_file_boundaries_stops_at_a_crossfaded_neighbour() {
+        let (mut e, t, a, b) = two_clips_one_file();
+        // A's end and B's start each reach 2 000 samples into the other, as Create Fades leaves them.
+        e.session_mut().find_clip_mut(a).unwrap().trim_end_to(50_000);
+        e.session_mut().find_clip_mut(b).unwrap().trim_start_to(46_000);
+        e.execute("edit.trim_to_file_boundaries", &json!({"clips": [b.0]})).unwrap();
+        assert_eq!(ranges(&e, t), vec![(0, 50_000, 0), (46_000, 432_000, 94_000)], "B grows right only");
+        e.execute("edit.trim_to_file_boundaries", &json!({"clips": [a.0]})).unwrap();
+        assert_eq!(ranges(&e, t)[0], (0, 50_000, 0), "A is boxed in by B");
     }
 
     #[test]
