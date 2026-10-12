@@ -586,6 +586,29 @@ fn trim_edge(e: &mut Engine, p: &Value, start: bool) -> Result<Value> {
     Ok(json!({"trimmed": n}))
 }
 
+/// The room a clip can grow into on its track: from the end of the clip before it (or 0) to
+/// the start of the clip after it. Extending trims stop there instead of layering over a
+/// neighbour (the mix sums overlapping clips).
+fn room_for(s: &Session, id: ClipId) -> (Samples, Samples) {
+    let Some((t, c)) = s.find_clip(id) else { return (0, Samples::MAX) };
+    let others = || s.track(t).into_iter().flat_map(|tr| tr.clips().iter()).filter(|o| o.id != id);
+    let lo = others().filter(|o| o.start < c.start).map(soundcraft_model::Clip::end).filter(|&e| e <= c.start).max().unwrap_or(0);
+    let hi = others().filter(|o| o.end() > c.end()).map(|o| o.start).filter(|&st| st >= c.end()).min().unwrap_or(Samples::MAX);
+    (lo.max(0), hi)
+}
+
+/// Trim a clip's edges to `[start, end)`, but never past its neighbours or before 0 (a
+/// neighbour that already overlaps it stops it growing, never shrinks it).
+fn trim_within_room(s: &mut Session, id: ClipId, start: Samples, end: Samples) -> bool {
+    let (lo, hi) = room_for(s, id);
+    let Some(c) = s.find_clip_mut(id) else { return false };
+    let start = start.max(lo).min(c.start.max(start));
+    let end = end.min(hi).max(c.end().min(end));
+    c.trim_start_to(start);
+    c.trim_end_to(end);
+    true
+}
+
 fn trim_to_file(e: &mut Engine, p: &Value) -> Result<Value> {
     let ids = clip_ids_param(e, p);
     let s = e.session_mut();
@@ -593,11 +616,10 @@ fn trim_to_file(e: &mut Engine, p: &Value) -> Result<Value> {
     for id in ids {
         let frames =
             s.find_clip(id).and_then(|(_, c)| c.source()).and_then(|src| s.source(src)).map(|src| i64::try_from(src.frames).unwrap_or(i64::MAX));
-        if let (Some(frames), Some(c)) = (frames, s.find_clip_mut(id)) {
-            let off = c.source_offset();
-            let new_start = c.start - off;
-            c.trim_start_to(new_start);
-            c.trim_end_to(new_start + frames);
+        let file_start = s.find_clip(id).map(|(_, c)| c.start - c.source_offset());
+        if let (Some(frames), Some(file_start)) = (frames, file_start)
+            && trim_within_room(s, id, file_start, file_start.saturating_add(frames))
+        {
             n += 1;
         }
     }
@@ -612,10 +634,10 @@ fn trim_to_fill(e: &mut Engine, p: &Value) -> Result<Value> {
     for id in ids {
         let frames =
             s.find_clip(id).and_then(|(_, c)| c.source()).and_then(|src| s.source(src)).map(|src| i64::try_from(src.frames).unwrap_or(i64::MAX));
-        if let (Some(frames), Some(c)) = (frames, s.find_clip_mut(id)) {
-            let file_start = c.start - c.source_offset();
-            c.trim_start_to(r.start.max(file_start));
-            c.trim_end_to(r.end.min(file_start + frames));
+        let file_start = s.find_clip(id).map(|(_, c)| c.start - c.source_offset());
+        if let (Some(frames), Some(file_start)) = (frames, file_start)
+            && trim_within_room(s, id, r.start.max(file_start), r.end.min(file_start.saturating_add(frames)))
+        {
             n += 1;
         }
     }
@@ -769,6 +791,7 @@ fn consolidate(e: &mut Engine, p: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use soundcraft_model::{ChannelFormat, Clip, TrackKind};
 
     #[test]
     fn selecting_what_is_already_selected_leaves_the_document_alone() {
@@ -781,5 +804,45 @@ mod tests {
         assert_eq!(e.revision, rev);
         e.execute("edit.select", &json!({"tracks": [ids[0]], "start": 100, "end": 300})).unwrap();
         assert_ne!(e.revision, rev);
+    }
+
+    /// A 10 s source; clip A at 0..1 s, clip B at 1..2 s playing the file from 2 s (the
+    /// "um" in between was cut).
+    fn two_clips_one_file() -> (Engine, soundcraft_model::TrackId, ClipId, ClipId) {
+        let mut s = Session::default();
+        let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+        let buf = soundcraft_audio_io::AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.1; 480_000]] };
+        let src = crate::io::add_source(&mut s, "f", buf, None, soundcraft_audio_io::FileFormat::Wav);
+        let (a, b) = (s.new_clip_id(), s.new_clip_id());
+        ops::place_clip(&mut s, t, Clip::audio(a, "a", src, 0, 0, 48_000));
+        ops::place_clip(&mut s, t, Clip::audio(b, "b", src, 96_000, 48_000, 48_000));
+        (Engine::new(s), t, a, b)
+    }
+
+    fn ranges(e: &Engine, t: soundcraft_model::TrackId) -> Vec<(Samples, Samples, Samples)> {
+        e.session().track(t).unwrap().clips().iter().map(|c| (c.start, c.end(), c.source_offset())).collect()
+    }
+
+    #[test]
+    fn trim_to_file_boundaries_stops_at_neighbours_and_zero() {
+        let (mut e, t, _, b) = two_clips_one_file();
+        e.execute("edit.trim_to_file_boundaries", &json!({"clips": [b.0]})).unwrap();
+        // B grows right to the end of the file but not left over A; the audio stays in place.
+        assert_eq!(ranges(&e, t), vec![(0, 48_000, 0), (48_000, 432_000, 96_000)]);
+
+        let (mut e, t, a, b) = two_clips_one_file();
+        e.session_mut().track_mut(t).and_then(|tr| tr.playlist_mut()).unwrap().clips.retain(|c| c.id != a);
+        e.execute("edit.trim_to_file_boundaries", &json!({"clips": [b.0]})).unwrap();
+        // Alone, B would start 48 000 before the timeline; it stops at 0.
+        assert_eq!(ranges(&e, t), vec![(0, 432_000, 48_000)]);
+    }
+
+    #[test]
+    fn trim_to_fill_selection_stops_at_neighbours() {
+        let (mut e, t, a, _) = two_clips_one_file();
+        e.execute("edit.trim_to_fill_selection", &json!({"clips": [a.0], "start": 0, "end": 200_000})).unwrap();
+        assert_eq!(ranges(&e, t), vec![(0, 48_000, 0), (48_000, 96_000, 96_000)]);
+        e.execute("edit.trim_to_fill_selection", &json!({"clips": [a.0], "start": 10_000, "end": 20_000})).unwrap();
+        assert_eq!(ranges(&e, t)[0], (10_000, 20_000, 10_000), "shrinking to the selection still works");
     }
 }
