@@ -48,12 +48,17 @@ fn process(e: &mut Engine, p: &Value) -> Result<Value> {
         }
         let mut audio = soundcraft_mix::render_clips(e.session(), track, clip.range());
         // Render without the clip's own fades: re-render a copy without fades so they stay editable.
+        // Invert and Duplicate keep the clip gain on the clip (below), so they render without it;
+        // every other process resets it to unity, so it renders it into the new file.
+        let keeps_gain = matches!(name.as_str(), "invert" | "duplicate");
         let mut tmp = e.session().clone();
         if let Some(c) = tmp.find_clip_mut(id) {
             c.fade_in = Default::default();
             c.fade_out = Default::default();
-            c.gain_db = 0.0;
-            c.gain_env.clear();
+            if keeps_gain {
+                c.gain_db = 0.0;
+                c.gain_env.clear();
+            }
         }
         if let Some(pl) = tmp.track_mut(track).and_then(|t| t.playlist_mut()) {
             pl.clips.retain(|c| c.id == id);
@@ -109,7 +114,7 @@ fn process(e: &mut Engine, p: &Value) -> Result<Value> {
         nc.length = i64::try_from(frames).unwrap_or(nc.length);
         // Invert and Duplicate are phase/copy operations. The clip's gain stays a clip gain,
         // the same way its fades stay editable. Other processes bake a new file at unity gain.
-        if !matches!(name.as_str(), "invert" | "duplicate") {
+        if !keeps_gain {
             nc.gain_db = 0.0;
             nc.gain_env.clear();
         }
@@ -164,5 +169,21 @@ mod tests {
         assert_eq!(c.gain_env, vec![(0, 0.0), (32, -12.0)]);
         let sample = e.session().pool.get(c.source().unwrap()).unwrap().buffer.channels[0][0];
         assert!((sample - 0.5).abs() < 1e-3, "duplicate keeps the file level and the clip gain, got {sample}");
+    }
+
+    #[test]
+    fn other_processes_bake_clip_gain_into_the_file() {
+        // Reverse (and every process but Invert/Duplicate) resets the clip gain to unity, so the
+        // gain must be in the rendered file; it used to be dropped, making the clip 6 dB louder.
+        let (mut e, id) = gained_clip();
+        e.execute("audiosuite.process", &json!({"process": "reverse", "clips": [id.0]})).unwrap();
+        let c = e.session().tracks[0].clips()[0].clone();
+        assert_eq!((c.gain_db, c.gain_env.len()), (0.0, 0));
+        let ch = &e.session().pool.get(c.source().unwrap()).unwrap().buffer.channels[0];
+        // Reversed: the last sample had -6 dB clip gain and 0 dB envelope; the first, -6 - 12 dB.
+        let want_last = 0.5 * 10f32.powf(-6.0 / 20.0);
+        let want_first = 0.5 * 10f32.powf(-18.0 / 20.0);
+        assert!((ch[63] - want_last).abs() < 1e-3, "{} vs {want_last}", ch[63]);
+        assert!((ch[0] - want_first).abs() < 1e-3, "{} vs {want_first}", ch[0]);
     }
 }
