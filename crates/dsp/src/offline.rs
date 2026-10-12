@@ -1,8 +1,7 @@
 //! AudioSuite-style whole-buffer processing on planar `f32` audio.
 //!
 //! These functions may allocate (they are not for the audio thread) but never panic: lengths,
-//! rates and ratios are sanitized and output sizes are capped at [`MAX_OFFLINE_SAMPLES`] per
-//! channel.
+//! rates and ratios are sanitized and output sizes are capped per channel (see [`scaled_len`]).
 
 use std::f64::consts::PI;
 
@@ -13,8 +12,33 @@ pub use crate::osc::Waveform;
 use crate::util::sane_sr;
 use crate::{Plugin, db_to_gain, gain_to_db};
 
-/// Largest number of samples per channel any offline function will produce.
+/// Output size (samples per channel) every offline function may produce whatever its input:
+/// about 93 minutes at 48 kHz. Longer inputs get more room; see [`scaled_len`].
 pub const MAX_OFFLINE_SAMPLES: usize = 1 << 28;
+
+/// How many times its input length an offline output may grow to when the input is already
+/// longer than [`MAX_OFFLINE_SAMPLES`] (covers sample-rate conversion up to 2× and stretches up to 2×).
+pub const MAX_LONG_INPUT_GROWTH: usize = 2;
+
+/// Output length for an operation that turns `len` input samples into `len × ratio`: rounded and
+/// capped at [`MAX_OFFLINE_SAMPLES`] or `MAX_LONG_INPUT_GROWTH × len`, whichever is larger. A
+/// hostile ratio can't allocate without bound, and a long recording (a 2-hour audiobook is ~345 M
+/// samples at 48 kHz) is not cut short by a cap sized for short clips.
+pub fn scaled_len(len: usize, ratio: f64) -> usize {
+    let cap = MAX_OFFLINE_SAMPLES.max(len.saturating_mul(MAX_LONG_INPUT_GROWTH));
+    let want = len as f64 * ratio;
+    if !want.is_finite() || want <= 0.0 {
+        return 0;
+    }
+    let want = want.round();
+    if want >= cap as f64 {
+        if want > cap as f64 {
+            log::warn!("offline output of {want} samples truncated to {cap}");
+        }
+        return cap;
+    }
+    want as usize
+}
 
 /// Fade curves. [`FadeShape::gain`] is the fade-in curve; a fade-out uses `gain(1 - t)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
@@ -223,7 +247,7 @@ pub fn resample(ch: &[Vec<f32>], from: u32, to: u32) -> Vec<Vec<f32>> {
     let ratio = f64::from(to) / f64::from(from);
     ch.iter()
         .map(|c| {
-            let out_len = ((c.len() as f64 * ratio).round() as usize).min(MAX_OFFLINE_SAMPLES);
+            let out_len = scaled_len(c.len(), ratio);
             resample_ratio(std::slice::from_ref(c), ratio, out_len).into_iter().next().unwrap_or_default()
         })
         .collect()
@@ -238,7 +262,7 @@ pub fn resample(ch: &[Vec<f32>], from: u32, to: u32) -> Vec<Vec<f32>> {
 pub fn time_stretch(ch: &[Vec<f32>], ratio: f64, sample_rate: f32) -> Vec<Vec<f32>> {
     let len = max_len(ch);
     let ratio = if ratio.is_finite() { ratio.clamp(0.1, 10.0) } else { 1.0 };
-    let out_len = ((len as f64 * ratio).round() as usize).min(MAX_OFFLINE_SAMPLES);
+    let out_len = scaled_len(len, ratio);
     if len == 0 || ch.is_empty() {
         return ch.iter().map(|_| vec![0.0; out_len]).collect();
     }
@@ -496,7 +520,8 @@ pub fn apply_plugin_with_tail(ch: &[Vec<f32>], plugin: &mut dyn Plugin, sample_r
     let len = max_len(ch);
     plugin.prepare(sane_sr(sample_rate), 1024, ch.len());
     let tail = plugin.tail_samples().min((sane_sr(sample_rate) * 60.0) as usize);
-    render(ch, plugin, sample_rate, (len + tail).min(MAX_OFFLINE_SAMPLES))
+    // The tail is at most 60 s, so the output is the input plus a bounded amount.
+    render(ch, plugin, sample_rate, len.saturating_add(tail))
 }
 
 fn render(ch: &[Vec<f32>], plugin: &mut dyn Plugin, sample_rate: f32, out_len: usize) -> Vec<Vec<f32>> {
@@ -559,5 +584,25 @@ mod tests {
         assert_eq!(ch[0][99], 0.0);
         assert_eq!(ch[0][50], 1.0);
         fade(&mut ch, 1000, 1000, FadeShape::SCurve);
+    }
+
+    #[test]
+    fn long_inputs_are_not_cut_to_the_short_clip_cap() {
+        // A 2-hour 44.1 kHz audiobook resampled to 48 kHz used to stop at MAX_OFFLINE_SAMPLES
+        // (93 min at 48 kHz), silently dropping the last half hour.
+        let two_hours = 44_100 * 7_200;
+        assert_eq!(scaled_len(two_hours, 48_000.0 / 44_100.0), 48_000 * 7_200);
+        // A latency/tail render of a 3-hour file keeps every input sample.
+        let three_hours = 48_000 * 10_800;
+        assert_eq!(scaled_len(three_hours, 1.0), three_hours);
+        // Short inputs keep the old fixed cap; long ones may at most double.
+        assert_eq!(scaled_len(10, 1e12), MAX_OFFLINE_SAMPLES);
+        assert_eq!(scaled_len(three_hours, 10.0), three_hours * MAX_LONG_INPUT_GROWTH);
+        assert_eq!(scaled_len(usize::MAX, 4.0), usize::MAX);
+        // Degenerate ratios produce nothing.
+        assert_eq!(scaled_len(1000, f64::NAN), 0);
+        assert_eq!(scaled_len(1000, -1.0), 0);
+        assert_eq!(scaled_len(1000, f64::INFINITY), 0);
+        assert_eq!(scaled_len(1000, 0.5), 500);
     }
 }
