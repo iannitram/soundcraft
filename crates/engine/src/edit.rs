@@ -169,13 +169,21 @@ pub fn paste(s: &mut Session, track: TrackId, at: Samples, clips: &[Clip], lengt
             }
         }
     }
-    let mut ids = Vec::new();
+    // Clear what the pasted clips cover first, then insert them together: placing them one at a
+    // time let a later clip clear the overlapping tail (and fade) of an earlier one, destroying
+    // crossfades inside the pasted material.
+    let mut placed = Vec::with_capacity(clips.len());
     for c in clips {
         let mut nc = c.clone();
         nc.id = s.new_clip_id();
         nc.start += at;
-        ids.push(nc.id);
-        place_clip(s, track, nc);
+        clear_range(s, track, nc.range(), false);
+        placed.push(nc);
+    }
+    let ids = placed.iter().map(|c| c.id).collect();
+    if let Some(pl) = s.track_mut(track).and_then(|t| t.playlist_mut()) {
+        pl.clips.extend(placed);
+        pl.sort();
     }
     ids
 }
@@ -498,6 +506,24 @@ mod tests {
         delete_fades(&mut s, t, Range::new(2900, 3100));
         let c = s.track(t).unwrap().clips();
         assert_eq!((c[0].end(), c[1].start), (3000, 3000));
+    }
+
+    #[test]
+    fn paste_keeps_crossfades_inside_the_pasted_material() {
+        let (mut s, t) = session_with_clip();
+        separate_at(&mut s, t, 3000);
+        assert_eq!(create_fades(&mut s, t, Range::new(2900, 3100), FadeShape::Linear), 1);
+        let cb = copy_range(&s, t, Range::new(2000, 4000));
+        paste(&mut s, t, 6000, &cb, 2000, false);
+        let pasted: Vec<Clip> = s.track(t).unwrap().clips().iter().filter(|c| c.start >= 6000).cloned().collect();
+        assert_eq!(pasted.len(), 2);
+        assert_eq!((pasted[0].end(), pasted[0].fade_out.len), (7100, 200));
+        assert_eq!((pasted[1].start, pasted[1].fade_in.len), (6900, 200));
+        // What was under the paste is still overwritten.
+        let (mut s, t) = session_with_clip();
+        let cb = copy_range(&s, t, Range::new(1000, 2000));
+        paste(&mut s, t, 3000, &cb, 1000, false);
+        assert_eq!(clips(&s, t), vec![(1000, 2000, 1000), (3000, 1000, 1000), (4000, 1000, 4000)]);
     }
 
     #[test]
