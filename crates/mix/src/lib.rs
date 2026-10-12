@@ -686,16 +686,10 @@ impl MixEngine {
                         slot.plugin.process(&mut strip.buf, frames);
                     }
                 }
-                let v0 = volume_db_at(t, pos);
-                let v1 = volume_db_at(t, pos + frames as i64);
-                for (ch, src) in strip.buf.iter().enumerate().take(self.main.len()) {
-                    if let Some(m) = self.main.get_mut(ch) {
-                        for i in 0..frames {
-                            let g = lerp_gain(v0, v1, i, frames);
-                            if let (Some(d), Some(x)) = (m.get_mut(i), src.get(i)) {
-                                *d = x * g;
-                            }
-                        }
+                apply_fader(&mut strip.buf, frames, pos, |p| volume_db_at(t, p));
+                for (m, src) in self.main.iter_mut().zip(strip.buf.iter()) {
+                    if let (Some(d), Some(sr)) = (m.get_mut(..frames), src.get(..frames)) {
+                        d.copy_from_slice(sr);
                     }
                 }
                 self.meters.entry(t.id).or_default().measure(&self.main, frames, 0.0);
@@ -944,38 +938,52 @@ fn process_strip(
             d.extend_from_slice(src.get(..frames).unwrap_or(&[]));
         }
     }
-    // Endpoints are the first and last sample of this block. The next block starts on its own
-    // first sample, so a breakpoint there does not ramp the block before it.
-    let last = pos.saturating_add(frames.saturating_sub(1) as i64);
-    let mut v0 = volume_db_at(t, pos);
-    let mut v1 = volume_db_at(t, last);
-    // Trim automation (an offset on top of the volume curve).
-    if let Some(l) = t
+    let vca = t.mixer.vca.and_then(|vid| s.tracks.iter().find(|x| x.id.0 == vid && x.kind == TrackKind::Vca));
+    if vca.is_some_and(|v| v.mixer.mute) {
+        strip.muted = true;
+    }
+    let trim = t
         .automation
         .iter()
         .find(|l| matches!(&l.param, AutoParam::Plugin { slot: u8::MAX, param } if param == "trim"))
-        .filter(|l| !l.points.is_empty())
-    {
-        v0 += l.value_at(pos, 0.0);
-        v1 += l.value_at(last, 0.0);
-    }
-    // VCA master: its fader offsets the member's, and its mute mutes the member.
-    if let Some(vid) = t.mixer.vca
-        && let Some(vca) = s.tracks.iter().find(|x| x.id.0 == vid && x.kind == TrackKind::Vca)
-    {
-        v0 += volume_db_at(vca, pos);
-        v1 += volume_db_at(vca, last);
-        if vca.mixer.mute {
-            strip.muted = true;
+        .filter(|l| !l.points.is_empty());
+    let muted = strip.muted;
+    apply_fader(&mut strip.buf, frames, pos, |p| {
+        if muted {
+            return -144.0;
         }
-    }
-    let (g0, g1) = if strip.muted { (-144.0, -144.0) } else { (v0.min(12.0), v1.min(12.0)) };
-    for c in strip.buf.iter_mut() {
-        for i in 0..frames {
-            if let Some(x) = c.get_mut(i) {
-                *x *= lerp_gain(g0, g1, i, frames.saturating_sub(1));
+        // Trim automation is an offset on top of the volume curve; a VCA master's fader
+        // offsets the member's.
+        let db = volume_db_at(t, p) + trim.map_or(0.0, |l| l.value_at(p, 0.0)) + vca.map_or(0.0, |v| volume_db_at(v, p));
+        db.min(12.0)
+    });
+}
+
+/// Fader gain is evaluated at the first and last sample of each cell of this many samples (cells
+/// are fixed to the timeline) and ramped linearly in between, so a step on a cell edge stays a
+/// step, and the result doesn't depend on where blocks start or how long they are:
+/// a bounce matches playback at any buffer size, and a breakpoint inside a block is not skipped.
+const FADER_STEP: Samples = 32;
+
+/// Multiply `frames` samples of every channel in `buf` (which start at timeline `pos`) by the
+/// gain of `db_at`, sampled every [`FADER_STEP`] samples.
+fn apply_fader(buf: &mut [Vec<f32>], frames: usize, pos: Samples, db_at: impl Fn(Samples) -> f32) {
+    let mut i = 0usize;
+    while i < frames {
+        let p = pos.saturating_add(i as i64);
+        let g = p.div_euclid(FADER_STEP).saturating_mul(FADER_STEP);
+        let n = usize::try_from(g.saturating_add(FADER_STEP).saturating_sub(p)).unwrap_or(1).clamp(1, frames - i);
+        let a = db_to_gain(db_at(g));
+        let b = db_to_gain(db_at(g.saturating_add(FADER_STEP - 1)));
+        let first = (p - g) as f32;
+        for c in buf.iter_mut() {
+            if let Some(seg) = c.get_mut(i..i + n) {
+                for (k, x) in seg.iter_mut().enumerate() {
+                    *x *= a + (b - a) * ((first + k as f32) / (FADER_STEP - 1) as f32);
+                }
             }
         }
+        i += n;
     }
 }
 
@@ -1466,12 +1474,6 @@ fn send_level(t: &Track, i: usize, base: f32, pos: Samples) -> f32 {
         return l.value_at(pos, base);
     }
     base
-}
-
-fn lerp_gain(db0: f32, db1: f32, i: usize, n: usize) -> f32 {
-    let g0 = db_to_gain(db0);
-    let g1 = db_to_gain(db1);
-    if n == 0 { g0 } else { g0 + (g1 - g0) * (i as f32 / n as f32) }
 }
 
 fn peak(x: &[f32]) -> f32 {
@@ -2121,6 +2123,28 @@ mod tests {
         let out = render_range(&s, Range::new(0, 48_000), 512);
         assert!(out[0][100] > 0.3);
         assert!(out[0][30_000].abs() < 1e-4);
+    }
+
+    /// Regression: the fader ramped only between the block's two ends, so a dip inside a block
+    /// was skipped and a bounce sounded different from playback at another buffer size.
+    #[test]
+    fn volume_automation_does_not_depend_on_the_block_size() {
+        let (mut s, t) = session_with_dc(0.5, 8192);
+        {
+            let tr = s.track_mut(t).unwrap();
+            let l = tr.lane_mut(&AutoParam::Volume);
+            l.set_point(0, 0.0);
+            l.set_point(512, -144.0);
+            l.set_point(1024, 0.0);
+        }
+        let big = render_range(&s, Range::new(0, 4096), 1024);
+        let small = render_range(&s, Range::new(0, 4096), 64);
+        let odd = render_range(&s, Range::new(0, 4096), 333);
+        assert!(big[0][512].abs() < 1e-4, "the dip inside a block was skipped: {}", big[0][512]);
+        for (i, ((a, b), c)) in big[0].iter().zip(&small[0]).zip(&odd[0]).enumerate() {
+            assert!((a - b).abs() < 1e-5 && (a - c).abs() < 1e-5, "sample {i}: {a} / {b} / {c}");
+        }
+        assert!(big[0][10] > 0.2 && big[0][2000] > 0.3, "{} {}", big[0][10], big[0][2000]);
     }
 
     #[test]
