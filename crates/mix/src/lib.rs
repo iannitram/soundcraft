@@ -1734,9 +1734,22 @@ fn apply_matrix(src: &[Vec<f32>], frames: usize, dst: &mut [Vec<f32>], m: &Matri
     }
 }
 
-/// Ceiling on one offline render (samples summed over channels): 2^29 f32 = 2 GiB, about 93
-/// minutes of stereo at 48 kHz. Longer requests are truncated rather than exhausting memory.
+/// Ceiling on one offline render (samples summed over channels). Natively 2^31 f32 = 8 GiB,
+/// which covers the 4-hour bounce limit for stereo at 48 kHz (about 6 h 12 min of stereo at
+/// 48 kHz); on 32-bit targets (wasm32, x86 Windows) 2^29 = 2 GiB, about 93 minutes of stereo at 48 kHz.
+/// Longer requests are truncated rather than exhausting memory, so callers that keep the result
+/// check [`render_fits`] first.
+#[cfg(target_pointer_width = "64")]
+pub const MAX_RENDER_SAMPLES: usize = 1 << 31;
+/// See the native definition.
+#[cfg(not(target_pointer_width = "64"))]
 pub const MAX_RENDER_SAMPLES: usize = 1 << 29;
+
+/// Whether an offline render of `frames` frames in `channels` channels fits under
+/// [`MAX_RENDER_SAMPLES`], i.e. comes back complete rather than truncated.
+pub fn render_fits(frames: i64, channels: usize) -> bool {
+    usize::try_from(frames.max(0)).is_ok_and(|f| f.checked_mul(channels.max(1)).is_some_and(|n| n <= MAX_RENDER_SAMPLES))
+}
 
 /// Offline render of the main mix over `range` (planar, [`main_channels`] channels in SMPTE/WAV
 /// order). The mix's delay-compensation latency is removed, so the result lines up with the
@@ -1975,6 +1988,25 @@ mod tests {
     use soundcraft_audio_io::AudioBuffer;
     use soundcraft_model::{Insert, SourceAudio, SourceId};
     use std::sync::Arc;
+
+    #[test]
+    fn render_fits_matches_the_truncation_cap() {
+        let per_ch = |ch: usize| i64::try_from(MAX_RENDER_SAMPLES / ch).unwrap_or(i64::MAX);
+        assert!(render_fits(per_ch(2), 2));
+        assert!(!render_fits(per_ch(2) + 1, 2));
+        assert!(render_fits(per_ch(1), 0), "zero channels counts as one");
+        assert!(render_fits(-5, 2));
+        assert!(!render_fits(i64::MAX, 2));
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn long_stereo_bounces_are_not_truncated() {
+        // A 2-hour stereo master at 48 kHz (the 4-hour bounce limit allows it) used to exceed
+        // the 2^29-sample cap and come back cut at about 93 minutes.
+        assert!(render_fits(48_000 * 3600 * 2, 2));
+        assert!(render_fits(48_000 * 3600 * 4, 2));
+    }
 
     fn synth_session(level_db: f32) -> Session {
         use soundcraft_midi::{Note, Sequence};

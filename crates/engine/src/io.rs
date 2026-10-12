@@ -242,6 +242,18 @@ pub fn bounce_bytes(e: &Engine, r: Range, opts: &EncodeOptions, normalize: bool)
     bounce_bytes_with(e, r, opts, normalize, false)
 }
 
+/// Refuse an offline render that [`soundcraft_mix`] would truncate (its memory cap), so a long
+/// render fails loudly instead of returning audio that silently stops early.
+fn ensure_render_fits(op: &str, frames: Samples, channels: usize) -> Result<()> {
+    if soundcraft_mix::render_fits(frames, channels) {
+        return Ok(());
+    }
+    let max_frames = soundcraft_mix::MAX_RENDER_SAMPLES / channels.max(1);
+    Err(EngineError::Unsupported(format!(
+        "{op}: {frames} frames × {channels} channels is longer than one render can hold ({max_frames} frames); split it into shorter parts"
+    )))
+}
+
 /// Render the main mix in its own format (every main channel, SMPTE/WAV order, with the WAV
 /// speaker mask of the main format), or an ITU stereo fold-down when `fold_stereo`.
 pub fn bounce_bytes_with(e: &Engine, r: Range, opts: &EncodeOptions, normalize: bool, fold_stereo: bool) -> Result<(Vec<u8>, (f32, f32, f32))> {
@@ -261,6 +273,8 @@ pub fn bounce_source(
     if r.len() > s.sample_rate.samples(4.0 * 3600.0) {
         return Err(EngineError::BadParams("file.bounce_mix".into(), "bounces are limited to 4 hours".into()));
     }
+    let nch = bus.map_or_else(|| soundcraft_mix::main_channels(s), |id| s.bus(id).map_or(0, |b| b.format.channels()));
+    ensure_render_fits("file.bounce_mix", r.len(), nch)?;
     let (mut ch, fmt) = render_bounce(s, r, fold_stereo, bus);
     if normalize {
         soundcraft_dsp::offline::normalize(&mut ch, -0.1, false);
@@ -303,6 +317,7 @@ pub fn bounce_stems(e: &Engine, dir: &str, r: Range, opts: &EncodeOptions) -> Re
 /// [`bounce_stems`] in the main format, or folded down to stereo when `fold_stereo`.
 pub fn bounce_stems_with(e: &Engine, dir: &str, r: Range, opts: &EncodeOptions, fold_stereo: bool) -> Result<Vec<String>> {
     let s = e.session();
+    ensure_render_fits("file.bounce_stems", r.len(), soundcraft_mix::main_channels(s))?;
     std::fs::create_dir_all(dir).map_err(|err| EngineError::Io(format!("{dir}: {err}")))?;
     let ext = match opts.format {
         FileFormat::Aiff => "aif",
@@ -351,6 +366,10 @@ pub fn transients_in(s: &Session, t: TrackId, r: Range, sens: f32) -> Vec<Sample
 /// Strip Silence: keep only the non-silent ranges of clips inside `r`.
 pub fn strip_silence(s: &mut Session, t: TrackId, r: Range, thr: f32, min_len: Samples, pre: Samples, post: Samples) -> usize {
     let r = bounded_to_track(s, t, r);
+    // A truncated render would make everything past the cap look silent and remove it.
+    if !soundcraft_mix::render_fits(r.len(), s.track(t).map_or(1, |x| x.channels())) {
+        return 0;
+    }
     let audio = soundcraft_mix::render_clips(s, t, r);
     let keep = soundcraft_dsp::offline::non_silent_ranges(
         &audio,
@@ -397,6 +416,7 @@ pub fn consolidate(e: &mut Engine, t: TrackId, r: Range) -> Result<bool> {
     if r.is_empty() {
         return Ok(false);
     }
+    ensure_render_fits("edit.consolidate", r.len(), s.track(t).map_or(1, |x| x.channels()))?;
     let audio = soundcraft_mix::render_clips(s, t, r);
     let name = format!("{}_consolidated", s.track(t).map_or("Audio", |x| x.name.as_str()));
     let buf = AudioBuffer { sample_rate: s.sample_rate.hz(), channels: audio };
@@ -415,6 +435,7 @@ pub fn render_clip_gain(e: &mut Engine, id: soundcraft_model::ClipId) -> Result<
     if !c.is_audio() {
         return Ok(false);
     }
+    ensure_render_fits("clip.render_gain", c.length, s.track(t).map_or(1, |x| x.channels()))?;
     let mut c2 = c.clone();
     c2.fade_in = Default::default();
     c2.fade_out = Default::default();
@@ -449,6 +470,7 @@ pub fn commit_track(e: &mut Engine, t: TrackId) -> Result<Option<TrackId>> {
         return Ok(None);
     }
     let range = Range::new(0, end + s.sample_rate.samples(2.0));
+    ensure_render_fits("track.commit", range.len(), tr.channels().max(2))?;
     let audio = soundcraft_mix::render_track_pre_fader(s, t, range);
     let name = format!("{}.cm", tr.name);
     let fmt = ChannelFormat::for_channels(audio.len().clamp(1, 2));
@@ -483,6 +505,7 @@ pub fn export_clips(e: &Engine, ids: &[soundcraft_model::ClipId], dir: &str) -> 
     let mut n = 0;
     for id in ids {
         let Some((t, c)) = s.find_clip(*id) else { continue };
+        ensure_render_fits("clip.export", c.length, s.track(t).map_or(1, |x| x.channels()))?;
         let audio = soundcraft_mix::render_clips(s, t, c.range());
         let buf = AudioBuffer { sample_rate: s.sample_rate.hz(), channels: audio };
         let bytes = soundcraft_audio_io::encode(&buf, &EncodeOptions::default()).map_err(|err| EngineError::Io(err.to_string()))?;
@@ -1298,5 +1321,56 @@ mod bundle_tests {
         write_file(&p.to_string_lossy(), b"hello").unwrap();
         assert_eq!(std::fs::read(&p).unwrap(), b"hello");
         let _ = std::fs::remove_file(&p);
+    }
+}
+
+#[cfg(test)]
+mod long_render_tests {
+    use super::*;
+
+    /// A stereo track holding one clip longer than one offline render can hold.
+    fn too_long() -> (Engine, TrackId, soundcraft_model::ClipId) {
+        let mut s = Session::default();
+        let t = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, None);
+        let frames = i64::try_from(soundcraft_mix::MAX_RENDER_SAMPLES / 2).unwrap_or(i64::MAX) + 48_000;
+        let id = s.new_clip_id();
+        crate::edit::place_clip(&mut s, t, Clip::audio(id, "long", SourceId(1), 0, 0, frames));
+        (Engine::new(s), t, id)
+    }
+
+    #[test]
+    fn renders_past_the_cap_fail_instead_of_truncating() {
+        let (mut e, t, id) = too_long();
+        let all = Range::new(0, e.session().content_end());
+        assert!(matches!(consolidate(&mut e, t, all), Err(EngineError::Unsupported(_))));
+        assert!(matches!(render_clip_gain(&mut e, id), Err(EngineError::Unsupported(_))));
+        assert!(matches!(commit_track(&mut e, t), Err(EngineError::Unsupported(_))));
+        let dir = std::env::temp_dir().join(format!("soundcraft-long-render-{}", std::process::id()));
+        let dir = dir.to_string_lossy().into_owned();
+        assert!(matches!(export_clips(&e, &[id], &dir), Err(EngineError::Unsupported(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+        // The clip is untouched.
+        let c = e.session().find_clip(id).map(|(_, c)| c.clone()).unwrap();
+        assert_eq!((c.start, c.source(), c.gain_db), (0, Some(SourceId(1)), 0.0));
+    }
+
+    #[test]
+    fn strip_silence_leaves_a_too_long_track_alone() {
+        let (mut e, t, id) = too_long();
+        let all = Range::new(0, e.session().content_end());
+        // Missing audio renders silent; a truncated render used to delete the clip as a "gap".
+        assert_eq!(strip_silence(e.session_mut(), t, all, -60.0, 4800, 0, 0), 0);
+        assert!(e.session().find_clip(id).is_some());
+    }
+
+    #[test]
+    fn bounces_past_the_cap_fail_instead_of_truncating() {
+        let mut s = Session { sample_rate: soundcraft_time::SampleRate::new(192_000).unwrap(), ..Session::default() };
+        s.add_track(TrackKind::Audio, ChannelFormat::Stereo, None);
+        let e = Engine::new(s);
+        let frames = i64::try_from(soundcraft_mix::MAX_RENDER_SAMPLES / 2).unwrap_or(i64::MAX) + 1;
+        let r = Range::new(0, frames);
+        assert!(r.len() <= e.session().sample_rate.samples(4.0 * 3600.0), "inside the 4-hour limit");
+        assert!(matches!(bounce_bytes(&e, r, &EncodeOptions::default(), false), Err(EngineError::Unsupported(_))));
     }
 }
