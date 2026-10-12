@@ -54,6 +54,15 @@ pub fn add_source(s: &mut Session, name: &str, mut buf: AudioBuffer, path: Optio
     id
 }
 
+/// Refuse a file whose conversion to the session rate `sr` the resampler would cut short (its
+/// output cap), so a long import fails loudly instead of losing its end.
+fn ensure_resample_fits(name: &str, buf: &AudioBuffer, sr: u32) -> std::result::Result<(), String> {
+    if soundcraft_dsp::offline::resample_fits(buf.frames(), buf.sample_rate, sr) {
+        return Ok(());
+    }
+    Err(format!("{name}: too long to convert from {} Hz to the session's {sr} Hz", buf.sample_rate))
+}
+
 /// Decode and place an audio file. With no target track, a new track of matching width is made.
 pub fn import_audio_bytes(e: &mut Engine, name: &str, bytes: &[u8], path: Option<&str>, target: Option<TrackId>, at: Samples) -> Result<Value> {
     let ext = Path::new(name).extension().and_then(|x| x.to_str()).map(str::to_ascii_lowercase);
@@ -66,6 +75,7 @@ pub fn import_audio_bytes(e: &mut Engine, name: &str, bytes: &[u8], path: Option
     }
     let channels = buf.num_channels();
     let s = e.session_mut();
+    ensure_resample_fits(name, &buf, s.sample_rate.hz()).map_err(EngineError::Unsupported)?;
     let src = add_source(s, name, buf, path, info.format);
     if let (Some(bwf), Some(sx)) = (info.bwf.as_ref(), s.sources.last_mut()) {
         sx.time_reference = bwf.time_reference;
@@ -736,6 +746,7 @@ pub fn open_session(e: &mut Engine, path: &str) -> Result<Vec<String>> {
 /// Decode one source's audio file into the session pool, at the session rate.
 fn load_source_audio(s: &mut Session, id: SourceId, bytes: &[u8], ext: Option<&str>) -> std::result::Result<(), String> {
     let (_, mut buf) = soundcraft_audio_io::decode(bytes, ext).map_err(|err| err.to_string())?;
+    ensure_resample_fits("audio", &buf, s.sample_rate.hz())?;
     if buf.sample_rate != s.sample_rate.hz() && buf.sample_rate > 0 {
         buf.channels = soundcraft_dsp::offline::resample(&buf.channels, buf.sample_rate, s.sample_rate.hz());
         buf.sample_rate = s.sample_rate.hz();
