@@ -233,6 +233,17 @@ fn paste(e: &mut Engine, p: &Value) -> Result<Value> {
     for (i, t) in tracks.iter().enumerate() {
         let Some(clips) = cb.tracks.get(i % cb.tracks.len().max(1)) else { continue };
         pasted += ops::paste(s, *t, at, clips, cb.length, sh).len();
+        // Shuffle pushes later material right by the pasted length (as `ops::paste` measures
+        // it); the automation moves with it.
+        if follow
+            && sh
+            && let Some(tr) = s.track_mut(*t)
+        {
+            let len = cb.length.max(clips.iter().map(soundcraft_model::Clip::end).max().unwrap_or(0));
+            for l in &mut tr.automation {
+                l.shift_from(at, len);
+            }
+        }
         if follow && let (Some(lanes), Some(tr)) = (cb.automation.get(i % cb.automation.len().max(1)), s.track_mut(*t)) {
             for l in lanes {
                 let dst = tr.lane_mut(&l.param);
@@ -254,6 +265,7 @@ fn clear(e: &mut Engine, p: &Value) -> Result<Value> {
     let range = range_param(e, "edit.clear", p)?;
     let ids = clip_ids_param(e, p);
     let sh = shuffle(e.session());
+    let follow = e.session().edit.automation_follows_edit;
     let s = e.session_mut();
     let mut n = 0;
     if range.is_empty() && !ids.is_empty() {
@@ -268,6 +280,16 @@ fn clear(e: &mut Engine, p: &Value) -> Result<Value> {
     } else {
         for t in &tracks {
             n += ops::clear_range(s, *t, range, sh).len();
+            // Shuffle closes the gap; the automation closes it too, as Cut does.
+            if follow
+                && sh
+                && let Some(tr) = s.track_mut(*t)
+            {
+                for l in &mut tr.automation {
+                    l.clear_range(range.start, range.end);
+                    l.shift_from(range.end, -range.len());
+                }
+            }
         }
     }
     Ok(json!({"removed": n}))
@@ -769,6 +791,7 @@ fn consolidate(e: &mut Engine, p: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use soundcraft_model::{ChannelFormat, Clip, SourceId, TrackKind};
 
     #[test]
     fn selecting_what_is_already_selected_leaves_the_document_alone() {
@@ -781,5 +804,55 @@ mod tests {
         assert_eq!(e.revision, rev);
         e.execute("edit.select", &json!({"tracks": [ids[0]], "start": 100, "end": 300})).unwrap();
         assert_ne!(e.revision, rev);
+    }
+
+    /// One mono track with a 10 s clip and Volume points at 100 000 and 300 000, in Shuffle.
+    fn shuffle_with_volume_points() -> (Engine, soundcraft_model::TrackId) {
+        let mut s = Session::default();
+        let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+        let id = s.new_clip_id();
+        ops::place_clip(&mut s, t, Clip::audio(id, "c", SourceId(1), 0, 0, 480_000));
+        s.edit.edit_mode = EditMode::Shuffle;
+        s.edit.automation_follows_edit = true;
+        if let Some(tr) = s.track_mut(t) {
+            let l = tr.lane_mut(&soundcraft_model::AutoParam::Volume);
+            l.set_point(100_000, -10.0);
+            l.set_point(300_000, 0.0);
+        }
+        (Engine::new(s), t)
+    }
+
+    fn volume_points(e: &Engine, t: soundcraft_model::TrackId) -> Vec<Samples> {
+        let tr = e.session().track(t).unwrap();
+        tr.automation.iter().filter(|l| l.param == soundcraft_model::AutoParam::Volume).flat_map(|l| l.points.iter().map(|p| p.at)).collect()
+    }
+
+    #[test]
+    fn shuffle_clear_ripples_automation_like_cut() {
+        let (mut e, t) = shuffle_with_volume_points();
+        e.execute("edit.clear", &json!({"tracks": [t.0], "start": 50_000, "end": 150_000})).unwrap();
+        assert_eq!(e.session().track(t).unwrap().clips().iter().map(|c| c.end()).max(), Some(380_000));
+        assert_eq!(volume_points(&e, t), vec![200_000]);
+
+        let (mut cut, t) = shuffle_with_volume_points();
+        cut.execute("edit.cut", &json!({"tracks": [t.0], "start": 50_000, "end": 150_000})).unwrap();
+        assert_eq!(volume_points(&cut, t), volume_points(&e, t));
+    }
+
+    #[test]
+    fn shuffle_paste_pushes_automation_right() {
+        let (mut e, t) = shuffle_with_volume_points();
+        e.execute("edit.copy", &json!({"tracks": [t.0], "start": 0, "end": 48_000})).unwrap();
+        e.execute("edit.paste", &json!({"tracks": [t.0], "at": 0})).unwrap();
+        assert_eq!(e.session().track(t).unwrap().clips().iter().map(|c| c.end()).max(), Some(528_000));
+        assert_eq!(volume_points(&e, t), vec![148_000, 348_000]);
+    }
+
+    #[test]
+    fn slip_clear_leaves_automation_in_place() {
+        let (mut e, t) = shuffle_with_volume_points();
+        e.session_mut().edit.edit_mode = EditMode::Slip;
+        e.execute("edit.clear", &json!({"tracks": [t.0], "start": 50_000, "end": 150_000})).unwrap();
+        assert_eq!(volume_points(&e, t), vec![100_000, 300_000]);
     }
 }
