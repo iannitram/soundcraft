@@ -141,13 +141,16 @@ pub fn copy_range(s: &Session, track: TrackId, range: Range) -> Vec<Clip> {
     for c in tr.clips() {
         let Some(isect) = c.range().intersect(&range) else { continue };
         let mut part = c.clone();
+        // A cut-off edge is a plain edit, as in split_clip: the clip's fades stay behind.
         if isect.start > part.start {
             let old = part.start;
             part.trim_start_to(isect.start);
             rebase_midi_start(&mut part, old, t);
+            part.fade_in = Fade::default();
         }
         if isect.end < part.end() {
             part.trim_end_to(isect.end);
+            part.fade_out = Fade::default();
         }
         part.start -= range.start;
         out.push(part);
@@ -462,6 +465,28 @@ mod tests {
         assert_eq!((copied[0].start, copied[0].length, copied[0].source_offset()), (0, 1000, 1500));
         paste(&mut s, t, 4000, &copied, 1000, false);
         assert_eq!(clips(&s, t), vec![(1000, 3000, 1000), (4000, 1000, 1500)]);
+    }
+
+    #[test]
+    fn copy_leaves_fades_outside_the_range_behind() {
+        // A clip [1000, 5000) with a 500-sample fade-in and fade-out. Copying its middle used to
+        // carry both fades along, so the pasted piece faded where the original played at full level.
+        let (mut s, t) = session_with_clip();
+        if let Some(c) = s.track_mut(t).and_then(|t| t.playlist_mut()).and_then(|p| p.clips.first_mut()) {
+            c.fade_in = Fade { len: 500, shape: FadeShape::Linear };
+            c.fade_out = Fade { len: 500, shape: FadeShape::Linear };
+        }
+        let middle = copy_range(&s, t, Range::new(2000, 3000));
+        assert_eq!((middle[0].fade_in.len, middle[0].fade_out.len), (0, 0));
+        // Copy and Cut put the same material on the clipboard.
+        let mut cut = s.clone();
+        let removed = clear_range(&mut cut, t, Range::new(2000, 3000), false);
+        assert_eq!((removed[0].fade_in.len, removed[0].fade_out.len), (0, 0));
+        // A range that includes a clip edge keeps that edge's fade.
+        let head = copy_range(&s, t, Range::new(0, 2000));
+        assert_eq!((head[0].fade_in.len, head[0].fade_out.len), (500, 0));
+        let tail = copy_range(&s, t, Range::new(4000, 6000));
+        assert_eq!((tail[0].fade_in.len, tail[0].fade_out.len), (0, 500));
     }
 
     #[test]
