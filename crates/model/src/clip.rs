@@ -273,10 +273,33 @@ impl Clip {
         self.clamp_fades();
     }
 
-    /// Keep both fades within the clip.
+    /// Keep both fades within the clip, and from overlapping each other: when together they
+    /// are longer than the clip, both shrink in proportion. (Overlapping fades multiply, so the
+    /// middle of the clip would dip: two linear fades over the whole clip leave it at -12 dB.)
     pub fn clamp_fades(&mut self) {
-        self.fade_in.len = self.fade_in.len.clamp(0, self.length);
-        self.fade_out.len = self.fade_out.len.clamp(0, self.length);
+        let length = self.length.max(0);
+        self.fade_in.len = self.fade_in.len.max(0);
+        self.fade_out.len = self.fade_out.len.max(0);
+        let total = i128::from(self.fade_in.len) + i128::from(self.fade_out.len);
+        if total > i128::from(length) {
+            let fade_in = i128::from(self.fade_in.len) * i128::from(length) / total;
+            self.fade_in.len = Samples::try_from(fade_in).unwrap_or(0).clamp(0, length);
+            self.fade_out.len = length - self.fade_in.len;
+        }
+    }
+
+    /// Set the fade-in, shortening the fade-out if the two would overlap.
+    pub fn set_fade_in(&mut self, fade: Fade) {
+        self.fade_in = Fade { len: fade.len.clamp(0, self.length.max(0)), ..fade };
+        self.fade_out.len = self.fade_out.len.min(self.length.max(0) - self.fade_in.len);
+        self.clamp_fades();
+    }
+
+    /// Set the fade-out, shortening the fade-in if the two would overlap.
+    pub fn set_fade_out(&mut self, fade: Fade) {
+        self.fade_out = Fade { len: fade.len.clamp(0, self.length.max(0)), ..fade };
+        self.fade_in.len = self.fade_in.len.min(self.length.max(0) - self.fade_out.len);
+        self.clamp_fades();
     }
 
     /// A sync point (0 means none) that a trim left outside the clip no longer marks anything.
@@ -347,6 +370,32 @@ pub(crate) fn db_to_gain(db: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trimming_the_start_keeps_the_gain_envelope() {
+        // A ramp from 0 dB to -20 dB; splitting at 500 must not change what the right half plays.
+        let mut c = Clip::audio(ClipId(1), "a", SourceId(1), 0, 0, 1000);
+        c.gain_env = vec![(0, 0.0), (1000, -20.0)];
+        let before: Vec<f32> = (500..1000).step_by(50).map(|t| c.gain_at(t)).collect();
+        c.trim_start_to(500);
+        let after: Vec<f32> = (0..500).step_by(50).map(|t| c.gain_at(t)).collect();
+        for (b, a) in before.iter().zip(&after) {
+            assert!((b - a).abs() < 1e-5, "{before:?} vs {after:?}");
+        }
+        assert_eq!(c.gain_env.first(), Some(&(0, -10.0)));
+
+        // Every point before the new start: the last value holds.
+        let mut c = Clip::audio(ClipId(1), "a", SourceId(1), 0, 0, 1000);
+        c.gain_env = vec![(0, 0.0), (100, -12.0)];
+        c.trim_start_to(400);
+        assert!((c.gain_at(0) - db_to_gain(-12.0)).abs() < 1e-6);
+
+        // A point exactly at the new start is kept as is, not duplicated.
+        let mut c = Clip::audio(ClipId(1), "a", SourceId(1), 0, 0, 1000);
+        c.gain_env = vec![(0, 0.0), (500, -6.0), (1000, 0.0)];
+        c.trim_start_to(500);
+        assert_eq!(c.gain_env, vec![(0, -6.0), (500, 0.0)]);
+    }
 
     #[test]
     fn fade_shapes_hit_endpoints() {
@@ -478,5 +527,25 @@ mod tests {
         c.fade_out = Fade { len: 800, shape: FadeShape::Linear, curvature: 0.0 };
         c.trim_start_to(900);
         assert!(c.fade_out.len <= c.length);
+    }
+
+    /// Regression: fades that overlapped multiplied, dipping the middle of a short clip.
+    #[test]
+    fn fades_never_overlap() {
+        let mut c = Clip::audio(ClipId(1), "a", SourceId(1), 0, 0, 1000);
+        c.fade_in = Fade { len: 600, shape: FadeShape::Linear, curvature: 0.0 };
+        c.fade_out = Fade { len: 200, shape: FadeShape::Linear, curvature: 0.0 };
+        c.trim_end_to(400);
+        assert_eq!((c.fade_in.len, c.fade_out.len), (300, 100), "trimming shrinks both fades in proportion");
+        c.set_fade_in(Fade { len: 350, shape: FadeShape::Linear, curvature: 0.0 });
+        assert_eq!((c.fade_in.len, c.fade_out.len), (350, 50), "a new fade-in shortens the fade-out");
+        c.set_fade_out(Fade { len: 1000, shape: FadeShape::Linear, curvature: 0.0 });
+        assert_eq!((c.fade_in.len, c.fade_out.len), (0, 400), "a new fade-out shortens the fade-in");
+        let mut c = Clip::audio(ClipId(2), "b", SourceId(1), 0, 0, 1000);
+        c.fade_in = Fade { len: 1000, shape: FadeShape::Linear, curvature: 0.0 };
+        c.fade_out = Fade { len: 1000, shape: FadeShape::Linear, curvature: 0.0 };
+        c.clamp_fades();
+        assert!(c.fade_in.len + c.fade_out.len <= c.length);
+        assert!(c.gain_at(500) > 0.99, "the middle of the clip stays at full level: {}", c.gain_at(500));
     }
 }

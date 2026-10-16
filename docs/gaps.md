@@ -1,6 +1,6 @@
 # Where SoundCraft falls short of Pro Tools
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-12 · **Change:** minor (G-01: audio device settings and opt-in ASIO) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-12 · **Change:** minor (G-01: audio device settings and opt-in ASIO; G-14: PR CI runs the quality gate) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 Every known shortfall, one entry each, ranked by how much it stops a Pro Tools user from doing
 real work in SoundCraft. This is the work list: pick from the top. Rows marked **alpha blocker**
@@ -28,7 +28,7 @@ When you close a gap, delete its entry (or shrink it) in the same PR, and bump t
 | G-11 | No external sync (MTC, LTC, MIDI clock, video reference) | Hardware | [hardware-parity.md](hardware-parity.md) | 15–25 |
 | G-12 | Immersive delivery: no Dolby Atmos/ADM BWF, MPEG-H, binaural | Features | [file-format-parity.md](file-format-parity.md) | 50–80 |
 | G-13 | Sidechain inputs, ARA, out-of-process plugin sandboxing | Ecosystem | [plugin-parity.md](plugin-parity.md) | 30–50 |
-| G-14 | Windows/Linux/Web exercised only lightly at runtime; no PR CI running the tests | Platforms / Stability | this file | 20–40 |
+| G-14 | Windows/Linux/Web exercised only lightly at runtime (PR CI runs the tests; no runtime smoke tests) | Platforms / Stability | this file | 15–30 |
 | G-15 | Elastic Audio depth: one algorithm, no Elastic Pitch | Features | [target-app-parity.md](target-app-parity.md) | 30–45 |
 | G-16 | Session templates, track presets, workspace browser, batch rename | Features | [target-app-parity.md](target-app-parity.md) | 25–40 |
 | G-17 | Video: HEVC/DNx decode, video export, external timecode | Features / Formats | [file-format-parity.md](file-format-parity.md) | 30–50 |
@@ -152,9 +152,10 @@ cannot be hosted (#109): Avid's AAX SDK licence and PACE signing; owner decision
 
 ### G-14. Platforms and CI
 
-Only `freebsd.yml` and `windows-arm64.yml` run on pull requests, and only for manifest paths;
-nothing runs `cargo xtask ci` on PRs. Windows and Linux have startup and rendering reports
-(#41, #45, #107, #142). ≈ 20–40 h (a PR CI matrix plus runtime smoke tests on three OSes).
+`pr-ci.yml` runs `cargo xtask ci` on Linux and the workspace tests on macOS and Windows for
+every pull request. Still missing: runtime smoke tests (launch, render a frame, play through the
+silent clock) on the three OSes. Windows and Linux have startup and rendering reports
+(#41, #45, #107, #142). ≈ 15–30 h for the smoke tests.
 
 ### G-15. Elastic Audio depth
 
@@ -200,5 +201,6 @@ missing. Out of scope unless the owner decides otherwise.
 | Date | Change | Summary |
 |---|---|---|
 | 2026-10-12 | minor | G-01 shrunk: audio device, rate and buffer choice; opt-in ASIO |
+| 2026-10-12 | minor | G-14 shrunk: `pr-ci.yml` runs `cargo xtask ci` on Linux and the tests on macOS and Windows for every PR |
 | 2026-10-10 | minor | Marked the alpha blockers (G-01, G-02, G-03; parts of G-05 and G-06) from the core-workflow gate |
 | 2026-10-10 | major | Created from the full re-measure against Pro Tools Ultimate 2026.4.1: 22 ranked gaps with evidence and estimates |
