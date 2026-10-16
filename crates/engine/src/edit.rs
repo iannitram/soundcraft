@@ -145,13 +145,16 @@ pub fn copy_range(s: &Session, track: TrackId, range: Range) -> Vec<Clip> {
     for c in tr.clips() {
         let Some(isect) = c.range().intersect(&range) else { continue };
         let mut part = c.clone();
+        // A cut-off edge is a plain edit, as in split_clip: the clip's fades stay behind.
         if isect.start > part.start {
             let old = part.start;
             part.trim_start_to(isect.start);
             rebase_midi_start(&mut part, old, t);
+            part.fade_in = Fade::default();
         }
         if isect.end < part.end() {
             part.trim_end_to(isect.end);
+            part.fade_out = Fade::default();
         }
         part.start -= range.start;
         out.push(part);
@@ -195,14 +198,18 @@ pub fn paste(s: &mut Session, track: TrackId, at: Samples, clips: &[Clip], lengt
     if shuffle {
         make_room(s, track, at, length)?;
     }
-    let mut ids = Vec::new();
+    // Clear what the pasted clips cover first, then insert them together: placing them one at a
+    // time let a later clip clear the overlapping tail (and fade) of an earlier one, destroying
+    // crossfades inside the pasted material.
+    let mut placed = Vec::with_capacity(clips.len());
     for c in clips {
         let mut nc = c.clone();
         nc.id = s.new_clip_id();
         nc.start += at;
-        ids.push(nc.id);
-        place_clip(s, track, nc);
+        placed.push((track, nc));
     }
+    let ids = placed.iter().map(|(_, c)| c.id).collect();
+    put_clips(s, placed);
     Ok(ids)
 }
 
@@ -782,14 +789,18 @@ pub fn create_fades(s: &mut Session, track: TrackId, range: Range, shape: FadeSh
             // Extend each clip into the other's territory using its handles.
             let ext_a = after.min(a_handle).max(0);
             let ext_b = before.min(b_handle).max(0);
+            // With handles, both fades span the overlap the handles allow, so the two clips
+            // overlap exactly and the crossfade has no gap. Without any, each clip fades to
+            // silence at the cut over its side of the selection.
+            let (out_len, in_len) = if ext_a + ext_b > 0 { (ext_a + ext_b, ext_a + ext_b) } else { (before, after) };
             if let Some(ca) = pl.clips.get_mut(i) {
                 ca.length += ext_a;
-                ca.fade_out = Fade { len: (ext_a + before).min(ca.length), shape, curvature: 0.0 };
+                ca.set_fade_out(Fade { len: out_len.min(ca.length), shape, curvature: 0.0 });
             }
             if let Some(cb) = pl.clips.get_mut(i + 1) {
                 let old = cb.start;
                 cb.trim_start_to(old - ext_b);
-                cb.fade_in = Fade { len: (ext_b + after).min(cb.length), shape, curvature: 0.0 };
+                cb.set_fade_in(Fade { len: in_len.min(cb.length), shape, curvature: 0.0 });
             }
             made += 1;
             xfaded.push(a.id);
@@ -798,10 +809,10 @@ pub fn create_fades(s: &mut Session, track: TrackId, range: Range, shape: FadeSh
     }
     for c in pl.clips.iter_mut().filter(|c| !xfaded.contains(&c.id)) {
         if range.start <= c.start && range.end > c.start && range.end < c.end() {
-            c.fade_in = Fade { len: range.end - c.start, shape, curvature: 0.0 };
+            c.set_fade_in(Fade { len: range.end - c.start, shape, curvature: 0.0 });
             made += 1;
         } else if range.end >= c.end() && range.start > c.start && range.start < c.end() {
-            c.fade_out = Fade { len: c.end() - range.start, shape, curvature: 0.0 };
+            c.set_fade_out(Fade { len: c.end() - range.start, shape, curvature: 0.0 });
             made += 1;
         }
     }
@@ -901,6 +912,28 @@ mod tests {
     }
 
     #[test]
+    fn copy_leaves_fades_outside_the_range_behind() {
+        // A clip [1000, 5000) with a 500-sample fade-in and fade-out. Copying its middle used to
+        // carry both fades along, so the pasted piece faded where the original played at full level.
+        let (mut s, t) = session_with_clip();
+        if let Some(c) = s.track_mut(t).and_then(|t| t.playlist_mut()).and_then(|p| p.clips.first_mut()) {
+            c.fade_in = Fade { len: 500, shape: FadeShape::Linear, curvature: 0.0 };
+            c.fade_out = Fade { len: 500, shape: FadeShape::Linear, curvature: 0.0 };
+        }
+        let middle = copy_range(&s, t, Range::new(2000, 3000));
+        assert_eq!((middle[0].fade_in.len, middle[0].fade_out.len), (0, 0));
+        // Copy and Cut put the same material on the clipboard.
+        let mut cut = s.clone();
+        let removed = clear_range(&mut cut, t, Range::new(2000, 3000), false);
+        assert_eq!((removed[0].fade_in.len, removed[0].fade_out.len), (0, 0));
+        // A range that includes a clip edge keeps that edge's fade.
+        let head = copy_range(&s, t, Range::new(0, 2000));
+        assert_eq!((head[0].fade_in.len, head[0].fade_out.len), (500, 0));
+        let tail = copy_range(&s, t, Range::new(4000, 6000));
+        assert_eq!((tail[0].fade_in.len, tail[0].fade_out.len), (0, 500));
+    }
+
+    #[test]
     fn paste_shuffle_ripples() {
         let (mut s, t) = session_with_clip();
         let copied = copy_range(&s, t, Range::new(1000, 2000));
@@ -934,6 +967,53 @@ mod tests {
         delete_fades(&mut s, t, Range::new(2900, 3100));
         let c = s.track(t).unwrap().clips();
         assert_eq!((c[0].end(), c[1].start), (3000, 3000));
+        // Regression: a fade-in over most of a clip with a fade-out used to overlap it.
+        let (mut s, t) = session_with_clip();
+        let c = s.track(t).unwrap().clips()[0].clone();
+        assert_eq!(create_fades(&mut s, t, Range::new(c.start + 1000, c.end() + 10), FadeShape::Linear), 1);
+        assert_eq!(create_fades(&mut s, t, Range::new(c.start - 10, c.end() - 500), FadeShape::Linear), 1);
+        let c = &s.track(t).unwrap().clips()[0];
+        assert_eq!(c.fade_in.len, c.length - 500);
+        assert_eq!(c.fade_out.len, 500);
+    }
+
+    #[test]
+    fn crossfade_without_handles_on_one_side_has_no_dip() {
+        // Clip b starts at the very beginning of its file, so it has no handle to extend left:
+        // the crossfade must happen after the cut, with both fades over the same span.
+        let (mut s, t) = session_with_clip();
+        separate_at(&mut s, t, 3000);
+        if let Some(b) = s.track_mut(t).and_then(|t| t.playlist_mut()).and_then(|p| p.clips.get_mut(1)) {
+            b.content = ClipContent::Audio { source: SourceId(500), offset: 0 };
+        }
+        assert_eq!(create_fades(&mut s, t, Range::new(2900, 3100), FadeShape::Linear), 1);
+        let c = s.track(t).unwrap().clips().to_vec();
+        assert_eq!((c[0].end(), c[1].start), (3100, 3000));
+        assert_eq!((c[0].fade_out.len, c[1].fade_in.len), (100, 100));
+        // A linear crossfade sums to unity everywhere.
+        let gain = |c: &Clip, at: Samples| if c.range().contains(at) { c.gain_at(at - c.start) } else { 0.0 };
+        for at in 2800..3200 {
+            let sum = gain(&c[0], at) + gain(&c[1], at);
+            assert!((sum - 1.0).abs() < 0.02, "gain {sum} at {at}");
+        }
+    }
+
+    #[test]
+    fn paste_keeps_crossfades_inside_the_pasted_material() {
+        let (mut s, t) = session_with_clip();
+        separate_at(&mut s, t, 3000);
+        assert_eq!(create_fades(&mut s, t, Range::new(2900, 3100), FadeShape::Linear), 1);
+        let cb = copy_range(&s, t, Range::new(2000, 4000));
+        paste(&mut s, t, 6000, &cb, 2000, false).unwrap();
+        let pasted: Vec<Clip> = s.track(t).unwrap().clips().iter().filter(|c| c.start >= 6000).cloned().collect();
+        assert_eq!(pasted.len(), 2);
+        assert_eq!((pasted[0].end(), pasted[0].fade_out.len), (7100, 200));
+        assert_eq!((pasted[1].start, pasted[1].fade_in.len), (6900, 200));
+        // What was under the paste is still overwritten.
+        let (mut s, t) = session_with_clip();
+        let cb = copy_range(&s, t, Range::new(1000, 2000));
+        paste(&mut s, t, 3000, &cb, 1000, false).unwrap();
+        assert_eq!(clips(&s, t), vec![(1000, 2000, 1000), (3000, 1000, 1000), (4000, 1000, 4000)]);
     }
 
     fn three_clips() -> (Session, TrackId, [ClipId; 3]) {
@@ -1040,5 +1120,29 @@ mod tests {
         assert_eq!(clips(&s, t), vec![(1500, 4000, 1000)]);
         s.find_clip_mut(id).unwrap().time_locked = true;
         assert_eq!(move_clips(&mut s, &[id], 500, &[]), 0);
+    }
+
+    #[test]
+    fn moving_crossfaded_clips_together_keeps_the_crossfade() {
+        let (mut s, t) = session_with_clip();
+        separate_at(&mut s, t, 3000);
+        assert_eq!(create_fades(&mut s, t, Range::new(2900, 3100), FadeShape::Linear), 1);
+        let before: Vec<Clip> = s.track(t).unwrap().clips().to_vec();
+        let ids: Vec<ClipId> = before.iter().map(|c| c.id).collect();
+        assert_eq!(move_clips(&mut s, &ids, 2000, &[]), 2);
+        let after: Vec<Clip> = s.track(t).unwrap().clips().to_vec();
+        assert_eq!(after.len(), 2);
+        for (a, b) in before.iter().zip(&after) {
+            assert_eq!(
+                (b.start, b.length, b.source_offset(), b.fade_in.len, b.fade_out.len),
+                (a.start + 2000, a.length, a.source_offset(), a.fade_in.len, a.fade_out.len)
+            );
+        }
+        // A moved clip still overwrites what it lands on.
+        let (mut s, t) = session_with_clip();
+        separate_at(&mut s, t, 3000);
+        let first = s.track(t).unwrap().clips()[0].id;
+        assert_eq!(move_clips(&mut s, &[first], 1000, &[]), 1);
+        assert_eq!(clips(&s, t), vec![(2000, 2000, 1000), (4000, 1000, 4000)]);
     }
 }

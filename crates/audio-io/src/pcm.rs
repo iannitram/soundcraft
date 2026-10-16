@@ -112,13 +112,67 @@ pub(crate) fn deinterleave(data: &[u8], kind: PcmKind, channels: usize, frames: 
         return Err(AudioError::TooLarge(format!("{total} samples exceeds the {MAX_DECODE_SAMPLES}-sample decode limit")));
     }
     let frames = usize::try_from(frames).map_err(|_| AudioError::TooLarge("frame count exceeds address space".into()))?;
-    let mut out: Vec<Vec<f32>> = (0..channels).map(|_| Vec::with_capacity(frames)).collect();
-    for frame in data.chunks_exact(block).take(frames) {
-        for (ch, s) in out.iter_mut().zip(frame.chunks_exact(bytes)) {
-            ch.push(decode_sample(s, kind));
+    let mut out: Vec<Vec<f32>> = (0..channels).map(|_| vec![0.0; frames]).collect();
+    let data = data.get(..frames.saturating_mul(block)).unwrap_or(data);
+    let threads = decode_threads(frames.saturating_mul(channels));
+    if threads <= 1 {
+        deinterleave_into(data, kind, block, out.iter_mut().map(Vec::as_mut_slice).collect());
+        return Ok(out);
+    }
+    // Split the frames into one contiguous run per thread; every thread writes its own part of
+    // every channel, so the result is identical to the serial loop.
+    let run = frames.div_ceil(threads).max(1);
+    let mut parts: Vec<Vec<&mut [f32]>> = Vec::new();
+    for ch in out.iter_mut() {
+        for (i, piece) in ch.chunks_mut(run).enumerate() {
+            if parts.len() <= i {
+                parts.push(Vec::with_capacity(channels));
+            }
+            if let Some(p) = parts.get_mut(i) {
+                p.push(piece);
+            }
         }
     }
+    // `Scope::spawn` panics when the OS refuses a thread; a run that got none is decoded here
+    // afterwards instead.
+    let mut unspawned = Vec::new();
+    std::thread::scope(|scope| {
+        for (i, (chunk, part)) in data.chunks(run.saturating_mul(block)).zip(parts).enumerate() {
+            if std::thread::Builder::new().spawn_scoped(scope, move || deinterleave_into(chunk, kind, block, part)).is_err() {
+                unspawned.push(i);
+            }
+        }
+    });
+    for i in unspawned {
+        let first = i.saturating_mul(run);
+        let chunk = data.get(first.saturating_mul(block)..).unwrap_or_default();
+        let chunk = chunk.get(..run.saturating_mul(block)).unwrap_or(chunk);
+        let end = first.saturating_add(run).min(frames);
+        let part = out.iter_mut().filter_map(|ch| ch.get_mut(first..end)).collect();
+        deinterleave_into(chunk, kind, block, part);
+    }
     Ok(out)
+}
+
+/// Decode whole frames of `data` into `out` (one slice per channel, all the same length).
+fn deinterleave_into(data: &[u8], kind: PcmKind, block: usize, mut out: Vec<&mut [f32]>) {
+    let bytes = kind.bytes();
+    for (f, frame) in data.chunks_exact(block).enumerate() {
+        for (ch, s) in out.iter_mut().zip(frame.chunks_exact(bytes)) {
+            if let Some(d) = ch.get_mut(f) {
+                *d = decode_sample(s, kind);
+            }
+        }
+    }
+}
+
+/// Worker threads for decoding `samples` samples: one for short files and where threads aren't
+/// available (wasm), otherwise up to the machine's parallelism (at most 16).
+fn decode_threads(samples: usize) -> usize {
+    if cfg!(target_arch = "wasm32") || samples < 1 << 20 {
+        return 1;
+    }
+    std::thread::available_parallelism().map_or(1, |n| n.get().min(16))
 }
 
 /// Converts `f32` samples to integers of a given bit depth, clamping to [-1, 1] and optionally
@@ -193,8 +247,8 @@ pub(crate) fn write_interleaved(
             for (c, q) in quantizers.iter_mut().enumerate() {
                 let s = block.get(c).and_then(|ch| ch.get(f)).copied().unwrap_or(0.0);
                 match (is_float, big_endian) {
-                    (true, false) => scratch.extend_from_slice(&clamp_float(s).to_le_bytes()),
-                    (true, true) => scratch.extend_from_slice(&clamp_float(s).to_be_bytes()),
+                    (true, false) => scratch.extend_from_slice(&finite_float(s).to_le_bytes()),
+                    (true, true) => scratch.extend_from_slice(&finite_float(s).to_be_bytes()),
                     (false, false) => scratch.extend_from_slice(q.quantize(s).to_le_bytes().get(..size).unwrap_or_default()),
                     (false, true) => scratch.extend_from_slice(q.quantize(s).to_be_bytes().get(4 - size..).unwrap_or_default()),
                 }
@@ -206,9 +260,11 @@ pub(crate) fn write_interleaved(
     Ok(())
 }
 
-/// Clamp a float sample to [-1, 1], mapping NaN to 0.
-pub(crate) fn clamp_float(x: f32) -> f32 {
-    if x.is_nan() { 0.0 } else { x.clamp(-1.0, 1.0) }
+/// A float sample as stored in a 32-bit float file: values beyond full scale are kept (float
+/// files carry headroom, and clipping them on save loses audio for good); NaN and ±infinity,
+/// which no reader can use, become 0.
+pub(crate) fn finite_float(x: f32) -> f32 {
+    if x.is_finite() { x } else { 0.0 }
 }
 
 /// Check that a buffer is encodable: at least one channel and a non-zero sample rate.
@@ -228,4 +284,51 @@ pub(crate) fn validate_layout(channels: usize, sample_rate: u32) -> Result<()> {
         return Err(AudioError::Encode("sample rate is 0".into()));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The threaded decode of a long file is identical to a frame-by-frame serial decode, for
+    /// every sample format, including a trailing partial frame and a frame count shorter than
+    /// the data.
+    #[test]
+    fn parallel_deinterleave_matches_serial() {
+        let kinds = [
+            PcmKind::Int { bytes: 1, big_endian: false, unsigned: true },
+            PcmKind::Int { bytes: 2, big_endian: false, unsigned: false },
+            PcmKind::Int { bytes: 3, big_endian: true, unsigned: false },
+            PcmKind::Float { bytes: 4, big_endian: false },
+            PcmKind::Float { bytes: 8, big_endian: true },
+        ];
+        for kind in kinds {
+            for channels in [1usize, 2, 3] {
+                let frames = (1usize << 20) / channels + 777;
+                let block = kind.bytes() * channels;
+                let mut x = 0x2545_f491u32;
+                let data: Vec<u8> = (0..frames * block + 5)
+                    .map(|_| {
+                        x ^= x << 13;
+                        x ^= x >> 17;
+                        x ^= x << 5;
+                        (x >> 24) as u8
+                    })
+                    .collect();
+                for want in [frames as u64, frames as u64 - 1000, u64::MAX] {
+                    let got = deinterleave(&data, kind, channels, want).unwrap();
+                    let n = want.min((data.len() / block) as u64) as usize;
+                    let mut serial: Vec<Vec<f32>> = (0..channels).map(|_| Vec::new()).collect();
+                    for frame in data.chunks_exact(block).take(n) {
+                        for (ch, s) in serial.iter_mut().zip(frame.chunks_exact(kind.bytes())) {
+                            ch.push(decode_sample(s, kind));
+                        }
+                    }
+                    // Compare bit patterns so NaNs from random float bytes compare equal.
+                    let bits = |v: &Vec<Vec<f32>>| v.iter().map(|c| c.iter().map(|x| x.to_bits()).collect::<Vec<_>>()).collect::<Vec<_>>();
+                    assert_eq!(bits(&got), bits(&serial), "{kind:?} x{channels} frames {want}");
+                }
+            }
+        }
+    }
 }

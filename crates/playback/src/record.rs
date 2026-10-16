@@ -570,10 +570,16 @@ mod tests {
 struct RingState {
     data: std::collections::VecDeque<f32>,
     phase: f64,
+    /// Frames per input callback lately (a slowly decaying maximum): how much the backlog
+    /// swings on its own between two reads.
+    chunk: usize,
 }
 
 /// A small interleaved FIFO from the input callback to the output callback, for input
 /// monitoring. Both sides only `try_lock`; it holds at most ~0.5 s and drops the oldest frames.
+/// The reader stays close to live: when more input has piled up than the two callbacks' own
+/// jitter explains (a stalled output, a glitch, clock drift), it skips ahead to recent audio
+/// instead of monitoring that much late from then on.
 /// The input device may run at a different rate than the session, so the reader converts
 /// rates with linear interpolation (cheap, allocation-free, fine for monitoring).
 pub struct InputRing {
@@ -590,7 +596,7 @@ impl InputRing {
         let ch = channels.max(1);
         let frames = if rate == 0 { 24_000 } else { rate as usize / 2 };
         Arc::new(InputRing {
-            state: Mutex::new(RingState { data: std::collections::VecDeque::with_capacity(rate.max(48_000) as usize * ch), phase: 0.0 }),
+            state: Mutex::new(RingState { data: std::collections::VecDeque::with_capacity(rate.max(48_000) as usize * ch), phase: 0.0, chunk: 0 }),
             channels: std::sync::atomic::AtomicUsize::new(ch),
             rate,
             cap: frames * ch,
@@ -599,6 +605,8 @@ impl InputRing {
 
     pub fn push(&self, samples: &[f32]) {
         if let Ok(mut s) = self.state.try_lock() {
+            let frames = samples.len() / self.channels.load(Ordering::Relaxed).max(1);
+            s.chunk = frames.max(s.chunk - s.chunk / 16);
             s.data.extend(samples.iter().copied().map(finite));
             while s.data.len() > self.cap {
                 s.data.pop_front();
@@ -616,6 +624,18 @@ impl InputRing {
         let Ok(mut s) = self.state.try_lock() else { return };
         // Input frames consumed per output frame.
         let step = if self.rate == 0 || session_rate == 0 { 1.0 } else { f64::from(self.rate) / f64::from(session_rate) };
+        // Catch up when the backlog is more than this read needs plus twice the slack the two
+        // callbacks need (one read, one input callback, at least 5 ms), keeping one slack.
+        let need = (frames as f64 * step).ceil() as usize + 2;
+        let in_rate = if self.rate == 0 { session_rate } else { self.rate };
+        let slack = need.max(s.chunk).max(in_rate as usize / 200);
+        let keep = need.saturating_add(slack);
+        let have = s.data.len() / ch;
+        if have > keep.saturating_add(slack) {
+            let stale = have.saturating_sub(keep).saturating_mul(ch).min(s.data.len());
+            s.data.drain(..stale);
+            s.phase = 0.0;
+        }
         for f in 0..frames {
             // Drop input frames we have moved past; keep the one at `phase` and the next one.
             while s.phase >= 1.0 && s.data.len() >= 2 * ch {
@@ -684,6 +704,63 @@ mod ring_tests {
         assert_eq!(out[0][0], 0.0);
         assert_eq!(out[1][0], 1.0);
         assert_eq!(out[0][49], 98.0);
+    }
+
+    /// Regression: input that piled up while the reader was away (half a second of it here)
+    /// used to be monitored half a second late from then on.
+    #[test]
+    fn monitor_catches_up_instead_of_staying_late() {
+        let ring = InputRing::new(1, 48_000);
+        let mut next = 0u32;
+        let mut feed = |frames: u32| {
+            let block: Vec<f32> = (next..next + frames).map(|i| i as f32).collect();
+            next += frames;
+            ring.push(&block);
+        };
+        for _ in 0..50 {
+            feed(480);
+        }
+        let mut out = vec![vec![0.0f32; 512]];
+        ring.pop_into(&mut out, 512, 48_000);
+        assert!(out[0][0] >= 24_000.0 - 2_400.0, "still {} frames behind the newest input", 24_000.0 - out[0][0]);
+        // From there on nothing more is skipped: every frame arrives once, in order.
+        let mut last = out[0][511];
+        assert_eq!(last, out[0][0] + 511.0);
+        for _ in 0..100 {
+            feed(512);
+            ring.pop_into(&mut out, 512, 48_000);
+            for v in &out[0] {
+                assert_eq!(*v, last + 1.0);
+                last = *v;
+            }
+        }
+    }
+
+    /// Callbacks that arrive in bursts (two writes, then two reads) are normal jitter, not a
+    /// backlog: nothing is skipped.
+    #[test]
+    fn monitor_keeps_every_frame_through_bursty_callbacks() {
+        let ring = InputRing::new(1, 48_000);
+        let mut next = 0u32;
+        let mut feed = |frames: u32| {
+            let block: Vec<f32> = (next..next + frames).map(|i| i as f32).collect();
+            next += frames;
+            ring.push(&block);
+        };
+        feed(240);
+        let mut out = vec![vec![0.0f32; 480]];
+        let mut want = 0.0f32;
+        for _ in 0..100 {
+            feed(480);
+            feed(480);
+            for _ in 0..2 {
+                ring.pop_into(&mut out, 480, 48_000);
+                for v in &out[0] {
+                    assert_eq!(*v, want);
+                    want += 1.0;
+                }
+            }
+        }
     }
 
     /// Nothing buffered: silence, not stale data.
