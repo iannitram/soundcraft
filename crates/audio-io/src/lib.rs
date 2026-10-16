@@ -256,7 +256,9 @@ pub fn decode(bytes: &[u8], ext_hint: Option<&str>) -> Result<(AudioInfo, AudioB
     }
 }
 
-/// Encode `buf` as WAV/BWF, AIFF/AIFF-C or FLAC. Samples are clamped to [-1, 1].
+/// Encode `buf` as WAV/BWF, AIFF/AIFF-C or FLAC. Integer depths clamp samples to [-1, 1]; 32-bit
+/// float keeps values beyond full scale. NaN and infinity are written as 0 (integer depths clamp
+/// infinity to full scale).
 pub fn encode(buf: &AudioBuffer, opts: &EncodeOptions) -> Result<Vec<u8>> {
     match opts.format {
         FileFormat::Wav => wav::encode(buf, opts.bit_depth, opts.dither, opts.bwf.as_ref(), false, None),

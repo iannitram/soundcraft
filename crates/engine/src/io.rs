@@ -18,8 +18,12 @@ pub(crate) fn at_rate(mut buf: AudioBuffer, rate: u32, limit: usize) -> Option<A
     if buf.frames() as f64 * buf.num_channels() as f64 * f64::from(rate) / f64::from(from) > limit as f64 {
         return None;
     }
+    // Refuse what the resampler would cut short rather than keep a shortened file.
+    if !soundcraft_dsp::offline::resample_fits(buf.frames(), from, rate) {
+        return None;
+    }
     if from != rate {
-        buf.channels = soundcraft_dsp::offline::resample(&buf.channels, from, rate);
+        soundcraft_dsp::offline::resample_in_place(&mut buf.channels, from, rate);
         buf.sample_rate = rate;
     }
     Some(buf)
@@ -99,7 +103,7 @@ fn unique_audio_rel(s: &Session, stem: &str) -> String {
 pub fn add_source(s: &mut Session, name: &str, mut buf: AudioBuffer, path: Option<&str>, format: FileFormat) -> SourceId {
     let sr = s.sample_rate.hz();
     if buf.sample_rate != sr && buf.sample_rate > 0 {
-        buf.channels = soundcraft_dsp::offline::resample(&buf.channels, buf.sample_rate, sr);
+        soundcraft_dsp::offline::resample_in_place(&mut buf.channels, buf.sample_rate, sr);
         buf.sample_rate = sr;
     }
     let id = SourceId(s.alloc());
@@ -612,7 +616,7 @@ pub fn bounce_stems_with(e: &Engine, dir: &str, r: Range, opts: &EncodeOptions, 
         FileFormat::Flac => "flac",
         _ => "wav",
     };
-    let mut out = Vec::new();
+    let mut out: Vec<String> = Vec::new();
     let stems: Vec<(TrackId, String)> = s
         .tracks
         .iter()
@@ -624,7 +628,12 @@ pub fn bounce_stems_with(e: &Engine, dir: &str, r: Range, opts: &EncodeOptions, 
         for t in &mut solo.tracks {
             t.mixer.solo = t.id == id;
         }
-        let path = Path::new(dir).join(format!("{} - {}.{ext}", sanitize_name(&s.name), sanitize_name(&name)));
+        // Track names that sanitize alike ("Mic?", "Mic!") or differ only by case must not
+        // overwrite each other's stem.
+        let stem = format!("{} - {}", sanitize_name(&s.name), sanitize_name(&name));
+        let named = |k: u32| Path::new(dir).join(if k < 2 { format!("{stem}.{ext}") } else { format!("{stem} {k}.{ext}") });
+        let used = |p: &Path| out.iter().any(|o| o.to_lowercase() == p.to_string_lossy().to_lowercase());
+        let path = (1..=10_000).map(named).find(|p| !used(p)).unwrap_or_else(|| named(1));
         Bounce::new(Arc::new(solo), &path, r, opts, None, false, fold_stereo)?.run()?;
         out.push(path.to_string_lossy().into_owned());
     }
@@ -1189,9 +1198,26 @@ pub fn session_bundle(session: &Session) -> Result<(Vec<u8>, Session)> {
     let zerr = |err: zip::result::ZipError| EngineError::Io(format!("bundle: {err}"));
     let ioerr = |err: std::io::Error| EngineError::Io(format!("bundle: {err}"));
     let mut s = session.clone();
+    // Refuse up front what `read_bundle` would refuse to open: a save that looks fine but never
+    // reopens loses the work. Audio is stored as 32-bit float WAV (4 bytes per sample).
+    let audio_bytes: u64 = s
+        .sources
+        .iter()
+        .filter(|x| s.pool.get(x.id).is_some())
+        .map(|x| x.frames.saturating_mul(u64::from(x.channels)).saturating_mul(4).saturating_add(4096))
+        .fold(0, u64::saturating_add);
+    if audio_bytes > MAX_BUNDLE_BYTES {
+        return Err(EngineError::Unsupported(format!(
+            "bundle: the session's audio needs {} MB, more than a bundle can hold ({} MB, about 46 minutes of 48 kHz stereo)",
+            audio_bytes >> 20,
+            MAX_BUNDLE_BYTES >> 20
+        )));
+    }
     let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored).large_file(true);
-    let mut taken = std::collections::HashSet::new();
+    // Sources whose audio is missing keep their old path; never hand that file name to another
+    // source, or reopening loads its audio into the missing one.
+    let mut taken: std::collections::HashSet<String> = s.sources.iter().filter(|x| s.pool.get(x.id).is_none()).map(|x| x.path.clone()).collect();
     for src in &mut s.sources {
         let Some(audio) = s.pool.get(src.id) else { continue };
         let base = sanitize_name(&src.name);
@@ -1309,6 +1335,10 @@ pub fn plan_takes(e: &Engine, unsaved_dir: &Path, input_channels: usize) -> Vec<
     let dir = e.path.as_deref().and_then(|p| Path::new(p).parent()).unwrap_or(unsaved_dir);
     let s = e.session();
     let take_no = s.sources.len() + 1;
+    // Paths already given out in this plan, compared case-insensitively: two track names can
+    // sanitize to the same file name ("Host?" and "Host!"), or differ only by case, which is
+    // the same file on default macOS and Windows file systems.
+    let mut taken = std::collections::HashSet::new();
     s.tracks
         .iter()
         .filter(|t| t.mixer.record_arm && t.kind == TrackKind::Audio && !t.inactive)
@@ -1321,7 +1351,9 @@ pub fn plan_takes(e: &Engine, unsaved_dir: &Path, input_channels: usize) -> Vec<
             };
             let inputs = (0..t.channels()).map(|k| first.saturating_add(k) % input_channels.max(1)).collect();
             let file = |n: usize| dir.join("Audio Files").join(format!("{}_{n:02}.wav", sanitize_name(&t.name)));
-            let path = (take_no..take_no + 1_000).map(file).find(|p| !p.exists()).unwrap_or_else(|| file(take_no));
+            let key = |p: &Path| p.to_string_lossy().to_lowercase();
+            let path = (take_no..take_no + 1_000).map(file).find(|p| !p.exists() && !taken.contains(&key(p))).unwrap_or_else(|| file(take_no));
+            taken.insert(key(&path));
             (t.id, inputs, path)
         })
         .collect()
@@ -1453,6 +1485,18 @@ mod record_tests {
         e.execute("edit.undo", &json!({})).unwrap();
         assert!(e.session().find_clip(clips[0]).is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn armed_tracks_never_share_a_take_file() {
+        let dir = std::env::temp_dir().join(format!("soundcraft-take-names-{}", std::process::id()));
+        let mut e = Engine::default();
+        armed(&mut e, "Host?", "mono", "In 1");
+        armed(&mut e, "Host!", "mono", "In 2");
+        armed(&mut e, "host_", "mono", "In 3");
+        let paths: Vec<PathBuf> = plan_takes(&e, &dir, 4).into_iter().map(|(_, _, p)| p).collect();
+        let files = ["Host__01.wav", "Host__02.wav", "host__03.wav"];
+        assert_eq!(paths, files.iter().map(|f| dir.join("Audio Files").join(f)).collect::<Vec<_>>());
     }
 
     #[test]
@@ -1823,6 +1867,21 @@ mod stem_tests {
         assert_eq!(n, 7, "{r}");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn stems_of_tracks_with_clashing_names_get_their_own_files() {
+        let mut e = crate::Engine::default();
+        for name in ["Mic?", "Mic!", "mic_"] {
+            e.execute("track.new", &serde_json::json!({"name": name, "format": "mono"})).unwrap();
+        }
+        let dir = std::env::temp_dir().join(format!("soundcraft-stem-names-{}", std::process::id()));
+        let r = e.execute("file.bounce_stems", &serde_json::json!({"dir": dir.to_string_lossy(), "start": 0, "end": 4800})).unwrap();
+        let files: Vec<String> = r["files"].as_array().unwrap().iter().filter_map(|f| f.as_str().map(str::to_owned)).collect();
+        let distinct: std::collections::HashSet<_> = files.iter().map(|f| f.to_lowercase()).collect();
+        assert_eq!((files.len(), distinct.len()), (3, 3), "{r}");
+        assert!(files.iter().all(|f| std::path::Path::new(f).exists()), "{r}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]
@@ -1887,6 +1946,36 @@ mod bundle_tests {
     }
 
     #[test]
+    fn a_bundle_too_big_to_reopen_is_refused_on_save() {
+        let mut e = crate::demo::demo_engine();
+        let s = e.session_mut();
+        // A 47-minute 48 kHz stereo source: 1.08 GB as float WAV.
+        s.sources[0].channels = 2;
+        s.sources[0].frames = 48_000 * 60 * 47;
+        assert!(matches!(session_bundle(e.session()), Err(EngineError::Unsupported(_))));
+        e.session_mut().sources[0].frames = 48_000 * 60 * 40;
+        assert!(session_bundle(e.session()).is_ok());
+    }
+
+    #[test]
+    fn a_missing_sources_path_is_not_reused_for_another_source() {
+        let mut e = crate::demo::demo_engine();
+        let s = e.session_mut();
+        // Source 0 was reported missing on open; source 1 has the same name and real audio.
+        let (missing, present) = (s.sources[0].id, s.sources[1].id);
+        s.sources[0].path = "Audio Files/Take.wav".into();
+        s.sources[1].name = "Take".into();
+        s.pool.remove(missing);
+        let (bytes, fresh) = session_bundle(e.session()).unwrap();
+        let path_of = |id| fresh.sources.iter().find(|x| x.id == id).map(|x| x.path.clone()).unwrap();
+        assert_ne!(path_of(present), path_of(missing));
+        let mut r = Engine::default();
+        let lost = open_session_bytes(&mut r, "x.scraftz", &bytes).unwrap();
+        assert!(r.session().pool.get(present).is_some(), "{lost:?}");
+        assert!(r.session().pool.get(missing).is_none());
+    }
+
+    #[test]
     fn same_named_sources_get_distinct_files() {
         let mut e = crate::demo::demo_engine();
         let name = e.session().sources[0].name.clone();
@@ -1931,5 +2020,36 @@ mod bundle_tests {
         write_file(&p.to_string_lossy(), b"hello").unwrap();
         assert_eq!(std::fs::read(&p).unwrap(), b"hello");
         let _ = std::fs::remove_file(&p);
+    }
+}
+
+#[cfg(test)]
+mod bwf_import_tests {
+    use super::*;
+
+    fn bwf_wav(rate: u32, time_reference: u64) -> Vec<u8> {
+        let buf = AudioBuffer { sample_rate: rate, channels: vec![vec![0.25; 4410]] };
+        let bwf = soundcraft_audio_io::BwfInfo { time_reference, ..Default::default() };
+        soundcraft_audio_io::encode(&buf, &EncodeOptions { bwf: Some(bwf), ..EncodeOptions::default() }).unwrap()
+    }
+
+    #[test]
+    fn bwf_timestamp_follows_the_import_resample() {
+        // 10:00:00 at 44.1 kHz imported into a 48 kHz session is 10:00:00 at 48 kHz.
+        let mut e = Engine::default();
+        assert_eq!(e.session().sample_rate.hz(), 48_000);
+        import_audio_bytes(&mut e, "a.wav", &bwf_wav(44_100, 44_100 * 36_000), None, None, 0).unwrap();
+        assert_eq!(e.session().sources.last().unwrap().time_reference, 48_000 * 36_000);
+        // Same rate: unchanged.
+        import_audio_bytes(&mut e, "b.wav", &bwf_wav(48_000, 12_345), None, None, 0).unwrap();
+        assert_eq!(e.session().sources.last().unwrap().time_reference, 12_345);
+    }
+
+    #[test]
+    fn rescale_rounds_and_saturates() {
+        assert_eq!(stamp_at_rate(1, 44_100, 48_000), 1);
+        assert_eq!(stamp_at_rate(441, 44_100, 48_000), 480);
+        assert_eq!(stamp_at_rate(u64::MAX, 1, 2), u64::MAX);
+        assert_eq!(stamp_at_rate(7, 0, 48_000), 7);
     }
 }
