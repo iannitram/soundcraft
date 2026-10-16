@@ -1,8 +1,7 @@
 //! AudioSuite-style whole-buffer processing on planar `f32` audio.
 //!
 //! These functions may allocate (they are not for the audio thread) but never panic: lengths,
-//! rates and ratios are sanitized and output sizes are capped at [`MAX_OFFLINE_SAMPLES`] per
-//! channel.
+//! rates and ratios are sanitized and output sizes are capped per channel (see [`scaled_len`]).
 
 use std::f64::consts::PI;
 
@@ -13,8 +12,68 @@ pub use crate::osc::Waveform;
 use crate::util::sane_sr;
 use crate::{Plugin, db_to_gain, gain_to_db};
 
-/// Largest number of samples per channel any offline function will produce.
+/// Output size (samples per channel) every offline function may produce whatever its input:
+/// about 93 minutes at 48 kHz. Longer inputs get more room; see [`scaled_len`].
 pub const MAX_OFFLINE_SAMPLES: usize = 1 << 28;
+
+/// How many times its input length an offline output may always grow to, however long the input
+/// (stretches up to 2×).
+pub const MAX_LONG_INPUT_GROWTH: usize = 2;
+
+/// How many times its input length an offline output may grow to while it stays within
+/// [`MAX_LONG_OUTPUT_SAMPLES`]: conversion between any two common sample rates (16 → 48 kHz is
+/// 3×, 8 → 48 kHz is 6×).
+pub const MAX_RATE_GROWTH: usize = 8;
+
+/// Output size (samples per channel) up to which [`MAX_RATE_GROWTH`] applies: 2^30 f32 = 4 GiB,
+/// about 6 h 12 min at 48 kHz. On 32-bit targets, which could not allocate that, the same as
+/// [`MAX_OFFLINE_SAMPLES`].
+#[cfg(target_pointer_width = "64")]
+pub const MAX_LONG_OUTPUT_SAMPLES: usize = 1 << 30;
+/// See the 64-bit definition.
+#[cfg(not(target_pointer_width = "64"))]
+pub const MAX_LONG_OUTPUT_SAMPLES: usize = MAX_OFFLINE_SAMPLES;
+
+/// Most samples an operation may turn `len` input samples into: [`MAX_OFFLINE_SAMPLES`],
+/// `MAX_LONG_INPUT_GROWTH × len`, or `MAX_RATE_GROWTH × len` up to [`MAX_LONG_OUTPUT_SAMPLES`],
+/// whichever is largest.
+fn output_cap(len: usize) -> usize {
+    let converted = len.saturating_mul(MAX_RATE_GROWTH).min(MAX_LONG_OUTPUT_SAMPLES);
+    MAX_OFFLINE_SAMPLES.max(len.saturating_mul(MAX_LONG_INPUT_GROWTH)).max(converted)
+}
+
+/// Output length for an operation that turns `len` input samples into `len × ratio`: rounded and
+/// capped (see [`MAX_OFFLINE_SAMPLES`], [`MAX_LONG_INPUT_GROWTH`] and [`MAX_RATE_GROWTH`]). A
+/// hostile ratio can't allocate without bound, and a long recording (a 2-hour audiobook is ~345 M
+/// samples at 48 kHz) is not cut short by a cap sized for short clips. Callers that keep the
+/// result check [`scaled_len_fits`] first.
+pub fn scaled_len(len: usize, ratio: f64) -> usize {
+    let cap = output_cap(len);
+    let want = len as f64 * ratio;
+    if !want.is_finite() || want <= 0.0 {
+        return 0;
+    }
+    let want = want.round();
+    if want >= cap as f64 {
+        if want > cap as f64 {
+            log::warn!("offline output of {want} samples truncated to {cap}");
+        }
+        return cap;
+    }
+    want as usize
+}
+
+/// Whether [`scaled_len`] gives `len × ratio` whole rather than cut at the cap.
+pub fn scaled_len_fits(len: usize, ratio: f64) -> bool {
+    let want = (len as f64 * ratio).round();
+    want.is_nan() || want <= output_cap(len) as f64
+}
+
+/// Whether [`resample`] converts all of a `len`-sample channel from `from` Hz to `to` Hz, rather
+/// than returning it cut at the cap.
+pub fn resample_fits(len: usize, from: u32, to: u32) -> bool {
+    from == 0 || to == 0 || from == to || scaled_len_fits(len, f64::from(to) / f64::from(from))
+}
 
 /// Fade curves. [`FadeShape::gain`] is the fade-in curve; a fade-out uses `gain(1 - t)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
@@ -183,27 +242,72 @@ impl SincTable {
     }
 }
 
+/// Output samples per worker below which [`fill_parallel`] stays on the calling thread.
+const PARALLEL_MIN_CHUNK: usize = 1 << 16;
+
+/// Fills `out` by calling `f(first_index, chunk)` on contiguous chunks, spread over the machine's
+/// cores with scoped threads. Every output sample depends only on its index, so the result is
+/// identical to one sequential call. Deliberately not the rayon pool: the realtime mixer runs its
+/// strips there, and a long offline job must not hold it. Without threads (wasm, a failed spawn)
+/// the work runs on the calling thread.
+fn fill_parallel(out: &mut [f32], f: impl Fn(usize, &mut [f32]) + Sync) {
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(out.len() / PARALLEL_MIN_CHUNK).max(1);
+    if threads <= 1 {
+        f(0, out);
+        return;
+    }
+    let chunk = out.len().div_ceil(threads);
+    let mut unspawned = Vec::new();
+    std::thread::scope(|scope| {
+        let f = &f;
+        let mut chunks = out.chunks_mut(chunk).enumerate();
+        let first = chunks.next();
+        for (i, c) in chunks {
+            if std::thread::Builder::new().spawn_scoped(scope, move || f(i * chunk, c)).is_err() {
+                unspawned.push(i);
+            }
+        }
+        if let Some((_, c)) = first {
+            f(0, c);
+        }
+    });
+    for i in unspawned {
+        let start = i * chunk;
+        if let Some(c) = out.get_mut(start..(start + chunk).min(out.len())) {
+            f(start, c);
+        }
+    }
+}
+
+/// Output sample `n` of a resampled channel: the windowed-sinc interpolation of `x` at input
+/// time `n / ratio`.
+fn resample_at(x: &[f32], ratio: f64, table: &SincTable, n: usize) -> f32 {
+    let len = x.len() as i64;
+    let hw = table.half_width;
+    let t = n as f64 / ratio;
+    let lo = (t - hw).ceil().max(0.0) as i64;
+    let hi = ((t + hw).floor() as i64).min(len - 1);
+    let mut acc = 0.0f32;
+    let mut j = lo;
+    while j <= hi {
+        if let Some(&v) = x.get(j as usize) {
+            acc += v * table.at(t - j as f64);
+        }
+        j += 1;
+    }
+    acc
+}
+
 /// Resamples one channel to exactly `out_len` samples, where output sample `n` is read at input
 /// time `n / ratio`.
 fn resample_channel(x: &[f32], ratio: f64, out_len: usize, table: &SincTable) -> Vec<f32> {
-    let len = x.len() as i64;
-    let hw = table.half_width;
-    (0..out_len)
-        .map(|n| {
-            let t = n as f64 / ratio;
-            let lo = (t - hw).ceil().max(0.0) as i64;
-            let hi = ((t + hw).floor() as i64).min(len - 1);
-            let mut acc = 0.0f32;
-            let mut j = lo;
-            while j <= hi {
-                if let Some(&v) = x.get(j as usize) {
-                    acc += v * table.at(t - j as f64);
-                }
-                j += 1;
-            }
-            acc
-        })
-        .collect()
+    let mut out = vec![0.0f32; out_len];
+    fill_parallel(&mut out, |first, chunk| {
+        for (k, o) in chunk.iter_mut().enumerate() {
+            *o = resample_at(x, ratio, table, first + k);
+        }
+    });
+    out
 }
 
 fn resample_ratio(ch: &[Vec<f32>], ratio: f64, out_len: usize) -> Vec<Vec<f32>> {
@@ -216,6 +320,13 @@ fn resample_ratio(ch: &[Vec<f32>], ratio: f64, out_len: usize) -> Vec<Vec<f32>> 
     ch.iter().map(|c| resample_channel(c, ratio, out_len, &table)).collect()
 }
 
+/// Output length of a `len`-sample channel resampled by `ratio`. [`resample`] and
+/// [`resample_in_place`] both take it from here, so the two can't come to cap long files
+/// differently.
+fn resampled_len(len: usize, ratio: f64) -> usize {
+    scaled_len(len, ratio)
+}
+
 /// High-quality windowed-sinc sample-rate conversion from `from` Hz to `to` Hz.
 pub fn resample(ch: &[Vec<f32>], from: u32, to: u32) -> Vec<Vec<f32>> {
     if from == 0 || to == 0 || from == to {
@@ -224,10 +335,26 @@ pub fn resample(ch: &[Vec<f32>], from: u32, to: u32) -> Vec<Vec<f32>> {
     let ratio = f64::from(to) / f64::from(from);
     ch.iter()
         .map(|c| {
-            let out_len = ((c.len() as f64 * ratio).round() as usize).min(MAX_OFFLINE_SAMPLES);
+            let out_len = resampled_len(c.len(), ratio);
             resample_ratio(std::slice::from_ref(c), ratio, out_len).into_iter().next().unwrap_or_default()
         })
         .collect()
+}
+
+/// [`resample`] in place, one channel at a time: each input channel is freed as soon as its
+/// output exists, so peak memory is the input plus one output channel rather than the input
+/// plus the whole output (for a long stereo import, about a quarter less). Same output as
+/// [`resample`].
+pub fn resample_in_place(ch: &mut [Vec<f32>], from: u32, to: u32) {
+    if from == 0 || to == 0 || from == to {
+        return;
+    }
+    let ratio = f64::from(to) / f64::from(from);
+    for c in ch.iter_mut() {
+        let out_len = resampled_len(c.len(), ratio);
+        let out = resample_ratio(std::slice::from_ref(c), ratio, out_len).into_iter().next().unwrap_or_default();
+        *c = out;
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -239,7 +366,7 @@ pub fn resample(ch: &[Vec<f32>], from: u32, to: u32) -> Vec<Vec<f32>> {
 pub fn time_stretch(ch: &[Vec<f32>], ratio: f64, sample_rate: f32) -> Vec<Vec<f32>> {
     let len = max_len(ch);
     let ratio = if ratio.is_finite() { ratio.clamp(0.1, 10.0) } else { 1.0 };
-    let out_len = ((len as f64 * ratio).round() as usize).min(MAX_OFFLINE_SAMPLES);
+    let out_len = scaled_len(len, ratio);
     if len == 0 || ch.is_empty() {
         return ch.iter().map(|_| vec![0.0; out_len]).collect();
     }
@@ -606,7 +733,8 @@ pub fn apply_plugin_with_tail(ch: &[Vec<f32>], plugin: &mut dyn Plugin, sample_r
     let len = max_len(ch);
     plugin.prepare(sane_sr(sample_rate), 1024, ch.len());
     let tail = plugin.tail_samples().min((sane_sr(sample_rate) * 60.0) as usize);
-    render(ch, plugin, sample_rate, (len + tail).min(MAX_OFFLINE_SAMPLES))
+    // The tail is at most 60 s, so the output is the input plus a bounded amount.
+    render(ch, plugin, sample_rate, len.saturating_add(tail))
 }
 
 fn render(ch: &[Vec<f32>], plugin: &mut dyn Plugin, sample_rate: f32, out_len: usize) -> Vec<Vec<f32>> {
@@ -652,6 +780,26 @@ pub fn peak_db(ch: &[Vec<f32>]) -> f32 {
 mod tests {
     use super::*;
 
+    /// Regression: merged with the long-file fix, the in-place resample that imports use still
+    /// stopped at the short-clip cap (93 minutes at 48 kHz).
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn both_resamplers_keep_all_of_a_long_file() {
+        let two_hours = 44_100 * 7_200;
+        assert_eq!(resampled_len(two_hours, 48_000.0 / 44_100.0), 48_000 * 7_200);
+        assert!(resampled_len(two_hours, 48_000.0 / 44_100.0) > MAX_OFFLINE_SAMPLES);
+    }
+
+    #[test]
+    fn resample_in_place_matches_resample() {
+        let ch: Vec<Vec<f32>> = (0..2).map(|c| (0..10_000).map(|i| ((i * (c + 3)) as f32 * 0.01).sin() * 0.5).collect()).collect();
+        for (from, to) in [(44_100, 48_000), (48_000, 44_100), (48_000, 48_000), (0, 48_000)] {
+            let mut inplace = ch.clone();
+            resample_in_place(&mut inplace, from, to);
+            assert_eq!(inplace, resample(&ch, from, to), "{from} -> {to}");
+        }
+    }
+
     #[test]
     fn fade_shapes_endpoints() {
         for s in FadeShape::ALL {
@@ -669,5 +817,72 @@ mod tests {
         assert_eq!(ch[0][99], 0.0);
         assert_eq!(ch[0][50], 1.0);
         fade(&mut ch, 1000, 1000, FadeShape::SCurve);
+    }
+
+    /// Regression: the first fix let long inputs grow 2× at most, so two hours at 22.05 kHz (a
+    /// spoken-word MP3) still lost their last ten minutes in a 48 kHz session, and three hours at
+    /// 8 kHz stopped at 93 minutes.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn long_low_rate_inputs_are_not_cut_short() {
+        for (rate, secs) in [(22_050usize, 7_200usize), (16_000, 9_000), (8_000, 10_800), (11_025, 10_800)] {
+            let ratio = 48_000.0 / rate as f64;
+            assert_eq!(scaled_len(rate * secs, ratio), 48_000 * secs, "{rate} Hz, {secs} s");
+            assert!(resample_fits(rate * secs, rate as u32, 48_000), "{rate} Hz, {secs} s");
+        }
+        // 44.1 → 96 kHz, two hours.
+        assert_eq!(scaled_len(44_100 * 7_200, 96_000.0 / 44_100.0), 96_000 * 7_200);
+    }
+
+    #[test]
+    fn long_inputs_are_not_cut_to_the_short_clip_cap() {
+        // A 2-hour 44.1 kHz audiobook resampled to 48 kHz used to stop at MAX_OFFLINE_SAMPLES
+        // (93 min at 48 kHz), silently dropping the last half hour.
+        let two_hours = 44_100 * 7_200;
+        assert_eq!(scaled_len(two_hours, 48_000.0 / 44_100.0), 48_000 * 7_200);
+        // A latency/tail render of a 3-hour file keeps every input sample.
+        let three_hours = 48_000 * 10_800;
+        assert_eq!(scaled_len(three_hours, 1.0), three_hours);
+        // Short inputs keep the old fixed cap. Long ones may always double, and grow further
+        // only up to MAX_LONG_OUTPUT_SAMPLES.
+        assert_eq!(scaled_len(10, 1e12), MAX_OFFLINE_SAMPLES);
+        assert!(!scaled_len_fits(10, 1e12) && !resample_fits(1 << 20, 1, 384_000));
+        assert_eq!(scaled_len(three_hours, 10.0), MAX_LONG_OUTPUT_SAMPLES.max(three_hours * MAX_LONG_INPUT_GROWTH));
+        assert!(!scaled_len_fits(three_hours, 10.0) && scaled_len_fits(three_hours, 2.0));
+        assert_eq!(scaled_len(usize::MAX, 4.0), usize::MAX);
+        // Nothing to convert always fits.
+        assert!(resample_fits(usize::MAX, 0, 48_000) && resample_fits(usize::MAX, 48_000, 48_000) && scaled_len_fits(1000, f64::NAN));
+        assert!(!scaled_len_fits(1000, f64::INFINITY));
+        // Degenerate ratios produce nothing.
+        assert_eq!(scaled_len(1000, f64::NAN), 0);
+        assert_eq!(scaled_len(1000, -1.0), 0);
+        assert_eq!(scaled_len(1000, f64::INFINITY), 0);
+        assert_eq!(scaled_len(1000, 0.5), 500);
+    }
+
+    #[test]
+    fn parallel_resample_matches_sequential_exactly() {
+        // Long enough to be split across threads (when the machine has more than one core).
+        let x: Vec<f32> = (0..300_000).map(|i| ((i as f32 * 0.013).sin() + (i as f32 * 0.31).cos() * 0.3) * 0.5).collect();
+        let ratio = 48_000.0 / 44_100.0;
+        let out_len = (x.len() as f64 * ratio).round() as usize;
+        let table = SincTable::new(0.97);
+        let par = resample_channel(&x, ratio, out_len, &table);
+        let seq: Vec<f32> = (0..out_len).map(|n| resample_at(&x, ratio, &table, n)).collect();
+        assert_eq!(par.len(), seq.len());
+        assert!(par.iter().zip(&seq).all(|(a, b)| a.to_bits() == b.to_bits()), "parallel output differs");
+    }
+
+    #[test]
+    fn fill_parallel_covers_every_index_once() {
+        for len in [0, 1, 1000, PARALLEL_MIN_CHUNK * 3 + 17] {
+            let mut out = vec![-1.0f32; len];
+            fill_parallel(&mut out, |first, chunk| {
+                for (k, o) in chunk.iter_mut().enumerate() {
+                    *o = (first + k) as f32;
+                }
+            });
+            assert!(out.iter().enumerate().all(|(i, &v)| v == i as f32), "len {len}");
+        }
     }
 }

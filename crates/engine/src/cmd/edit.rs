@@ -741,13 +741,13 @@ fn trim_to_fill(e: &mut Engine, p: &Value) -> Result<Value> {
 
 /// How far a trim may extend an audio clip: its source length in frames, and the earliest
 /// start and latest end before it would run over the clip before or after it on the playlist
-/// (an extension never overwrites, like the trim tool). An overlap the clip already has with
-/// a neighbour (a crossfade) is kept rather than trimmed away.
+/// (an extension never overwrites, like the trim tool), and never before 0. An overlap the clip
+/// already has with a neighbour (a crossfade) is kept rather than trimmed away.
 fn trim_limits(s: &Session, id: ClipId) -> Option<(Samples, Samples, Samples)> {
     let (track, c) = s.find_clip(id)?;
     let frames = c.source().and_then(|src| s.source(src)).map(|src| i64::try_from(src.frames).unwrap_or(i64::MAX))?;
     let others = || s.track(track).into_iter().flat_map(|t| t.clips()).filter(|x| x.id != id);
-    let lo = others().filter(|x| x.start < c.start).map(|x| x.end()).max().map_or(Samples::MIN, |end| end.min(c.start));
+    let lo = others().filter(|x| x.start < c.start).map(|x| x.end()).max().map_or(0, |end| end.max(0)).min(c.start);
     let hi = others().filter(|x| x.start > c.start).map(|x| x.start).min().map_or(Samples::MAX, |start| start.max(c.end()));
     Some((frames, lo, hi))
 }
@@ -965,7 +965,7 @@ fn consolidate(e: &mut Engine, p: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soundcraft_model::{ChannelFormat, Clip, ClipContent, TrackId, TrackKind};
+    use soundcraft_model::{ChannelFormat, Clip, ClipContent, SourceId, TrackId, TrackKind};
 
     #[test]
     fn targeted_fade_curvature_saves_reopens_and_undoes_without_changing_lengths() {
@@ -1095,6 +1095,69 @@ mod tests {
         assert_ne!(e.revision, rev);
     }
 
+    /// One mono track with a 10 s clip and Volume points at 100 000 and 300 000, in Shuffle.
+    fn shuffle_with_volume_points() -> (Engine, soundcraft_model::TrackId) {
+        let mut s = Session::default();
+        let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+        let id = s.new_clip_id();
+        ops::place_clip(&mut s, t, Clip::audio(id, "c", SourceId(1), 0, 0, 480_000));
+        s.edit.edit_mode = EditMode::Shuffle;
+        s.edit.automation_follows_edit = true;
+        if let Some(tr) = s.track_mut(t) {
+            let l = tr.lane_mut(&soundcraft_model::AutoParam::Volume);
+            l.set_point(100_000, -10.0);
+            l.set_point(300_000, 0.0);
+        }
+        (Engine::new(s), t)
+    }
+
+    fn volume_points(e: &Engine, t: soundcraft_model::TrackId) -> Vec<Samples> {
+        let tr = e.session().track(t).unwrap();
+        tr.automation.iter().filter(|l| l.param == soundcraft_model::AutoParam::Volume).flat_map(|l| l.points.iter().map(|p| p.at)).collect()
+    }
+
+    #[test]
+    fn shuffle_clear_ripples_automation_like_cut() {
+        let (mut e, t) = shuffle_with_volume_points();
+        e.execute("edit.clear", &json!({"tracks": [t.0], "start": 50_000, "end": 150_000})).unwrap();
+        assert_eq!(e.session().track(t).unwrap().clips().iter().map(|c| c.end()).max(), Some(380_000));
+        assert_eq!(volume_points(&e, t), vec![200_000]);
+
+        let (mut cut, t) = shuffle_with_volume_points();
+        cut.execute("edit.cut", &json!({"tracks": [t.0], "start": 50_000, "end": 150_000})).unwrap();
+        assert_eq!(volume_points(&cut, t), volume_points(&e, t));
+    }
+
+    #[test]
+    fn shuffle_paste_pushes_automation_right() {
+        let (mut e, t) = shuffle_with_volume_points();
+        e.execute("edit.copy", &json!({"tracks": [t.0], "start": 0, "end": 48_000})).unwrap();
+        e.execute("edit.paste", &json!({"tracks": [t.0], "at": 0})).unwrap();
+        assert_eq!(e.session().track(t).unwrap().clips().iter().map(|c| c.end()).max(), Some(528_000));
+        assert_eq!(volume_points(&e, t), vec![148_000, 348_000]);
+    }
+
+    #[test]
+    fn slip_clear_leaves_automation_in_place() {
+        let (mut e, t) = shuffle_with_volume_points();
+        e.session_mut().edit.edit_mode = EditMode::Slip;
+        e.execute("edit.clear", &json!({"tracks": [t.0], "start": 50_000, "end": 150_000})).unwrap();
+        assert_eq!(volume_points(&e, t), vec![100_000, 300_000]);
+    }
+
+    /// A 10 s source; clip A at 0..1 s, clip B at 1..2 s playing the file from 2 s (the
+    /// "um" in between was cut).
+    fn two_clips_one_file() -> (Engine, soundcraft_model::TrackId, ClipId, ClipId) {
+        let mut s = Session::default();
+        let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+        let buf = soundcraft_audio_io::AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.1; 480_000]] };
+        let src = crate::io::add_source(&mut s, "f", buf, None, soundcraft_audio_io::FileFormat::Wav);
+        let (a, b) = (s.new_clip_id(), s.new_clip_id());
+        ops::place_clip(&mut s, t, Clip::audio(a, "a", src, 0, 0, 48_000));
+        ops::place_clip(&mut s, t, Clip::audio(b, "b", src, 96_000, 48_000, 48_000));
+        (Engine::new(s), t, a, b)
+    }
+
     fn keys() -> (Engine, TrackId, impl Fn(i64) -> i64) {
         let mut e = Engine::default();
         let t = e.session_mut().add_track(TrackKind::Instrument, ChannelFormat::Stereo, Some("Keys"));
@@ -1208,5 +1271,42 @@ mod tests {
         e.execute("edit.restore_last_selection", &json!({})).unwrap();
         assert_eq!(e.session().edit.selection, soundcraft_time::Range::new(7_000, 9_000));
         assert_eq!(json!(tracks(&e)), json!([ids[1]]));
+    }
+
+    #[test]
+    fn trim_to_file_boundaries_stops_at_neighbours_and_zero() {
+        let (mut e, t, _, b) = two_clips_one_file();
+        e.execute("edit.trim_to_file_boundaries", &json!({"clips": [b.0]})).unwrap();
+        // B grows right to the end of the file but not left over A; the audio stays in place.
+        assert_eq!(bounds(&e, t), vec![(0, 48_000, 0), (48_000, 432_000, 96_000)]);
+
+        let (mut e, t, a, b) = two_clips_one_file();
+        e.session_mut().track_mut(t).and_then(|tr| tr.playlist_mut()).unwrap().clips.retain(|c| c.id != a);
+        e.execute("edit.trim_to_file_boundaries", &json!({"clips": [b.0]})).unwrap();
+        // Alone, B would start 48 000 before the timeline; it stops at 0.
+        assert_eq!(bounds(&e, t), vec![(0, 432_000, 48_000)]);
+    }
+
+    /// Regression: a neighbour that overlaps the clip (every crossfade is one) was not counted
+    /// as a neighbour at all, so the clip grew straight across it.
+    #[test]
+    fn trim_to_file_boundaries_stops_at_a_crossfaded_neighbour() {
+        let (mut e, t, a, b) = two_clips_one_file();
+        // A's end and B's start each reach 2 000 samples into the other, as Create Fades leaves them.
+        e.session_mut().find_clip_mut(a).unwrap().trim_end_to(50_000);
+        e.session_mut().find_clip_mut(b).unwrap().trim_start_to(46_000);
+        e.execute("edit.trim_to_file_boundaries", &json!({"clips": [b.0]})).unwrap();
+        assert_eq!(bounds(&e, t), vec![(0, 50_000, 0), (46_000, 432_000, 94_000)], "B grows right only");
+        e.execute("edit.trim_to_file_boundaries", &json!({"clips": [a.0]})).unwrap();
+        assert_eq!(bounds(&e, t)[0], (0, 50_000, 0), "A is boxed in by B");
+    }
+
+    #[test]
+    fn trim_to_fill_selection_stops_at_neighbours() {
+        let (mut e, t, a, _) = two_clips_one_file();
+        e.execute("edit.trim_to_fill_selection", &json!({"clips": [a.0], "start": 0, "end": 200_000})).unwrap();
+        assert_eq!(bounds(&e, t), vec![(0, 48_000, 0), (48_000, 96_000, 96_000)]);
+        e.execute("edit.trim_to_fill_selection", &json!({"clips": [a.0], "start": 10_000, "end": 20_000})).unwrap();
+        assert_eq!(bounds(&e, t)[0], (10_000, 20_000, 10_000), "shrinking to the selection still works");
     }
 }
