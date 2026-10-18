@@ -70,3 +70,11 @@ opt-level = 3
 lto = "thin"
 codegen-units = 16
 debug = 0
+
+# Opt-in maximum optimization (`cargo build --profile max`): whole-program LTO and one codegen
+# unit. Slower to build than `release`; release builds and installers are unaffected. No
+# target-cpu here: binaries stay portable, CPU-specific code paths dispatch at runtime.
+[profile.max]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
