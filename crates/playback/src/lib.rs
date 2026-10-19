@@ -164,6 +164,9 @@ struct AudioState {
     /// Stereo fold-down gains per main channel (used when the device has fewer channels).
     fold: [(f32, f32); MAX_CHANNELS],
     pending_len: usize,
+    /// The last rendered frame before `pending` (ours): a read between two blocks interpolates
+    /// from it into `pending[0]`.
+    carry: Vec<f32>,
     read: f64,
     device_rate: f64,
     input: Option<Arc<record::InputRing>>,
@@ -198,6 +201,7 @@ impl AudioState {
             looped: None,
             pending: vec![vec![0.0; BLOCK]; nch],
             pending_len: 0,
+            carry: vec![0.0; nch],
             read: 0.0,
             device_rate,
             input: None,
@@ -222,6 +226,7 @@ impl AudioState {
                     let nch = main_channels(&s);
                     if self.pending.len() != nch {
                         self.pending = vec![vec![0.0; BLOCK]; nch];
+                        self.carry = vec![0.0; nch];
                         self.pending_len = 0;
                         self.read = 0.0;
                     }
@@ -238,6 +243,7 @@ impl AudioState {
                     self.looped = looped.filter(|r| r.len() > 64);
                     self.playing = true;
                     self.pending_len = 0;
+                    self.carry.iter_mut().for_each(|x| *x = 0.0);
                     self.read = 0.0;
                     self.mix.reset();
                 }
@@ -250,6 +256,7 @@ impl AudioState {
                 Cmd::Locate(at) => {
                     self.pos = at;
                     self.pending_len = 0;
+                    self.carry.iter_mut().for_each(|x| *x = 0.0);
                     self.read = 0.0;
                     self.mix.reset();
                 }
@@ -345,7 +352,16 @@ impl AudioState {
         let callback_frames = out.len() / channels;
         let quantum = ((callback_frames as f64 * step).ceil() as usize).clamp(1, BLOCK);
         for frame in out.chunks_mut(channels) {
-            while self.read >= self.pending_len as f64 {
+            // ours (fb517d9, reworked 2026-10-19): a read between the last rendered sample and the
+            // next block interpolates from `carry` (that last sample) into the next block's first,
+            // instead of reading a stale sample past `pending_len`. Whole-number reads stay exact
+            // and nothing is rendered early unless the read actually falls between two blocks.
+            while self.read > self.pending_len as f64 - 1.0 {
+                if let Some(last) = self.pending_len.checked_sub(1) {
+                    for (k, ch) in self.carry.iter_mut().zip(&self.pending) {
+                        *k = ch.get(last).copied().unwrap_or(0.0);
+                    }
+                }
                 self.read -= self.pending_len as f64;
                 if !self.playing && !monitoring {
                     break;
@@ -355,14 +371,22 @@ impl AudioState {
                     break;
                 }
             }
-            let i0 = self.read.floor() as usize;
-            let fr = (self.read - i0 as f64) as f32;
+            let from_carry = self.read < 0.0;
+            let i0 = if from_carry { 0 } else { self.read.floor() as usize };
+            let fr = if from_carry { (self.read + 1.0) as f32 } else { (self.read - i0 as f64) as f32 };
             let sounding = self.playing || monitoring;
             let nch = self.pending.len();
+            let len = self.pending_len;
             let sample = |c: usize| {
                 let ch = self.pending.get(c);
-                let a = ch.and_then(|v| v.get(i0)).copied().unwrap_or(0.0);
-                let b = ch.and_then(|v| v.get(i0 + 1)).copied().unwrap_or(a);
+                let at = |i: usize| if i < len { ch.and_then(|v| v.get(i)).copied() } else { None };
+                let (a, b) = if from_carry {
+                    let a = self.carry.get(c).copied().unwrap_or(0.0);
+                    (a, at(0).unwrap_or(a))
+                } else {
+                    let a = at(i0).unwrap_or(0.0);
+                    (a, at(i0 + 1).unwrap_or(a))
+                };
                 a + (b - a) * fr
             };
             if channels < nch {
@@ -1190,6 +1214,39 @@ mod tests {
         let st = AudioState::new(rx, shared, Arc::new(s), 48_000.0, channel().0);
         tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
         st
+    }
+
+    #[test]
+    fn resampled_playback_is_smooth_across_block_edges() {
+        // A constant (DC) clip must come out constant when the device rate differs from the
+        // session rate: interpolation across a block edge used to read a stale sample.
+        use soundcraft_model::{ChannelFormat, Clip, SourceAudio, SourceId, TrackKind};
+        for (device_rate, speed) in [(44_100.0, 1000), (48_000.0, 1500), (96_000.0, 1000)] {
+            let mut s = soundcraft_model::Session::default();
+            let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+            let buf = soundcraft_audio_io::AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.5; 480_000]] };
+            s.pool.insert(SourceId(5), Arc::new(SourceAudio::new(buf)));
+            let id = s.new_clip_id();
+            s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(Clip::audio(id, "dc", SourceId(5), 0, 0, 480_000));
+            let shared = Arc::new(Shared {
+                position: AtomicI64::new(0),
+                playing: AtomicBool::new(false),
+                speed: AtomicU32::new(speed),
+                meters: Mutex::new(MeterSnapshot::default()),
+            });
+            let (tx, rx) = channel();
+            let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(s), device_rate, channel().0);
+            tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
+            let mut out = vec![0.0f32; 2 * 256];
+            st.fill(&mut out, 2);
+            let level = out[2 * 255];
+            assert!(level > 0.1, "{device_rate}/{speed}: the clip is heard ({level})");
+            for k in 0..20 {
+                st.fill(&mut out, 2);
+                let (lo, hi) = out.iter().step_by(2).fold((f32::MAX, f32::MIN), |(a, b), &x| (a.min(x), b.max(x)));
+                assert!(hi - lo < 1e-4 && (lo - level).abs() < 1e-4, "{device_rate}/{speed} callback {k}: {lo}..{hi}, expected {level}");
+            }
+        }
     }
 
     #[test]
