@@ -1436,8 +1436,17 @@ fn render_clip(s: &Session, clip: &Clip, pos: Samples, frames: usize, buf: &mut 
     let ClipContent::Audio { source, offset } = clip.content else { return };
     let block = Range { start: pos, end: pos.saturating_add(frames as i64) };
     let Some(isect) = clip.range().intersect(&block) else { return };
-    let Some(audio) = s.pool.get(source) else { return };
-    let nsrc = audio.buffer.channels.len();
+    // In-RAM audio is read in place (the default). Anything else goes through the `SampleSource`
+    // trait, but only off the audio thread: a streamed read may touch the disk and must never
+    // block the callback, so realtime playback of a streamed source is silent until a read-ahead
+    // layer exists. Offline mixdown/bounce reads it in chunks.
+    let ram = s.pool.get(source);
+    let stream = if ram.is_some() || on_audio_thread() { None } else { s.pool.get_source(source) };
+    let nsrc = match (&ram, &stream) {
+        (Some(a), _) => a.buffer.channels.len(),
+        (None, Some(st)) => st.channels(),
+        _ => return,
+    };
     if nsrc == 0 {
         return;
     }
@@ -1447,7 +1456,23 @@ fn render_clip(s: &Session, clip: &Clip, pos: Samples, frames: usize, buf: &mut 
     // Gain is evaluated every 32 samples and interpolated (fades and envelopes stay smooth).
     const STEP: usize = 32;
     for (ch, dst) in buf.iter_mut().enumerate() {
-        let src = audio.buffer.channels.get(ch % nsrc).map(Vec::as_slice).unwrap_or(&[]);
+        let window;
+        let (src, base): (&[f32], usize) = match (&ram, &stream) {
+            (Some(a), _) => (a.buffer.channels.get(ch % nsrc).map(Vec::as_slice).unwrap_or(&[]), 0),
+            (None, Some(st)) => {
+                window = stream_window(
+                    st.as_ref(),
+                    ch % nsrc,
+                    offset,
+                    stretch,
+                    pos.saturating_add(i0 as i64).saturating_sub(clip.start),
+                    pos.saturating_add(i1 as i64).saturating_sub(clip.start),
+                );
+                (window.0.as_slice(), window.1)
+            }
+            _ => (&[], 0),
+        };
+        let at = |x: usize| x.checked_sub(base).and_then(|x| src.get(x)).copied().unwrap_or(0.0);
         let mut i = i0;
         while i < i1 {
             let seg_end = (i + STEP).min(i1);
@@ -1461,13 +1486,13 @@ fn render_clip(s: &Session, clip: &Clip, pos: Samples, frames: usize, buf: &mut 
             for k in i..seg_end {
                 let rel = pos.saturating_add(k as i64).saturating_sub(clip.start);
                 let v = if (stretch - 1.0).abs() < 1e-9 {
-                    usize::try_from(offset.saturating_add(rel)).ok().and_then(|x| src.get(x)).copied().unwrap_or(0.0)
+                    usize::try_from(offset.saturating_add(rel)).ok().map_or(0.0, at)
                 } else {
                     let f = offset as f64 + rel as f64 / stretch;
                     let x0 = f.floor();
                     let fr = (f - x0) as f32;
-                    let a = if x0 >= 0.0 { src.get(x0 as usize).copied().unwrap_or(0.0) } else { 0.0 };
-                    let b = if x0 + 1.0 >= 0.0 { src.get((x0 as usize).saturating_add(1)).copied().unwrap_or(0.0) } else { 0.0 };
+                    let a = if x0 >= 0.0 { at(x0 as usize) } else { 0.0 };
+                    let b = if x0 + 1.0 >= 0.0 { at((x0 as usize).saturating_add(1)) } else { 0.0 };
                     a + (b - a) * fr
                 };
                 let t = (k - i) as f32 / n;
@@ -1478,6 +1503,23 @@ fn render_clip(s: &Session, clip: &Clip, pos: Samples, frames: usize, buf: &mut 
             i = seg_end;
         }
     }
+}
+
+/// Reads the part of one channel of a streamed source that a clip render over clip-relative
+/// frames `rel0..rel1` can touch (with a little margin for interpolation), returning the samples
+/// and the source frame the first one sits at. Offline renders only (it may block on disk).
+fn stream_window(st: &dyn soundcraft_model::SampleSource, ch: usize, offset: i64, stretch: f64, rel0: i64, rel1: i64) -> (Vec<f32>, usize) {
+    let lo = (offset as f64 + rel0 as f64 / stretch).floor() - 1.0;
+    let hi = (offset as f64 + rel1 as f64 / stretch).ceil() + 2.0;
+    let lo = lo.max(0.0) as u64;
+    let hi = (hi.max(0.0) as u64).min(st.frames());
+    if hi <= lo {
+        return (Vec::new(), 0);
+    }
+    let mut v = vec![0.0f32; (hi - lo) as usize];
+    let n = st.read(ch, lo, &mut v);
+    v.truncate(n);
+    (v, lo as usize)
 }
 
 /// The track's MIDI Track Offset (`midi.offset.<id>` in the edit values), in samples. Looked up
@@ -2345,6 +2387,74 @@ mod tests {
         lane.set_point(0, -48.0);
         tr.automation.push(lane);
         assert_eq!(render_range(&s, Range::new(0, 12_000), 512), reference);
+    }
+
+    /// Serves a ramp through the trait only (never in the pool's RAM map).
+    #[derive(Debug)]
+    struct Ramp(usize);
+    impl soundcraft_model::SampleSource for Ramp {
+        fn channels(&self) -> usize {
+            1
+        }
+        fn sample_rate(&self) -> u32 {
+            48_000
+        }
+        fn frames(&self) -> u64 {
+            self.0 as u64
+        }
+        fn read(&self, channel: usize, start: u64, out: &mut [f32]) -> usize {
+            if channel != 0 || start >= self.0 as u64 {
+                return 0;
+            }
+            let n = out.len().min(self.0 - start as usize);
+            for (k, o) in out[..n].iter_mut().enumerate() {
+                *o = (start as usize + k) as f32 / 1000.0;
+            }
+            n
+        }
+    }
+
+    fn ramp_session(streamed: bool, stretch: f64) -> (Session, TrackId) {
+        let mut s = Session::default();
+        let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+        let frames = 5000;
+        if streamed {
+            s.pool.insert_stream(SourceId(910), Arc::new(Ramp(frames)));
+        } else {
+            let ramp: Vec<f32> = (0..frames).map(|k| k as f32 / 1000.0).collect();
+            s.pool.insert(SourceId(910), Arc::new(SourceAudio::new(AudioBuffer { sample_rate: 48_000, channels: vec![ramp] })));
+        }
+        let id = s.new_clip_id();
+        if let Some(pl) = s.track_mut(t).and_then(|t| t.playlist_mut()) {
+            let mut c = Clip::audio(id, "ramp", SourceId(910), 100, 50, 3000);
+            c.stretch = stretch;
+            pl.clips.push(c);
+        }
+        (s, t)
+    }
+
+    #[test]
+    fn streamed_source_renders_like_in_ram_offline() {
+        for stretch in [1.0, 1.5] {
+            let (ram, t) = ramp_session(false, stretch);
+            let (stream, _) = ramp_session(true, stretch);
+            let r = Range::new(0, 4000);
+            let a = render_clips(&ram, t, r);
+            assert!(a[0].iter().any(|v| *v != 0.0));
+            assert_eq!(render_clips(&stream, t, r), a, "stretch {stretch}");
+            assert_eq!(render_range(&stream, r, 512), render_range(&ram, r, 512), "stretch {stretch}");
+        }
+    }
+
+    #[test]
+    fn streamed_source_is_silent_on_the_audio_thread() {
+        let (stream, t) = ramp_session(true, 1.0);
+        std::thread::spawn(move || {
+            mark_audio_thread();
+            assert!(render_clips(&stream, t, Range::new(0, 4000))[0].iter().all(|v| *v == 0.0));
+        })
+        .join()
+        .unwrap();
     }
 
     fn session_with_dc(level: f32, frames: usize) -> (Session, TrackId) {
