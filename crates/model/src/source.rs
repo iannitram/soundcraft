@@ -89,6 +89,12 @@ pub trait SampleSource: Send + Sync + std::fmt::Debug {
     /// how many were written (fewer than asked only at the end of the source, 0 past it or for an
     /// unknown channel).
     fn read(&self, channel: usize, start_frame: u64, out: &mut [f32]) -> usize;
+    /// True when `read` never blocks, locks or allocates, so the audio thread may call it (an
+    /// in-RAM source or a read-ahead wrapper). Default: false; a source that may touch the disk
+    /// on `read` is only read off the audio thread.
+    fn realtime_safe(&self) -> bool {
+        false
+    }
 }
 
 impl SampleSource for SourceAudio {

@@ -33,6 +33,8 @@ serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 log = "0.4"
 rayon = "1"
+# Lock-free SPSC ring for streamed-source read-ahead (MIT/Apache-2.0).
+rtrb = "0.3"
 proptest = "1"
 
 # audio
