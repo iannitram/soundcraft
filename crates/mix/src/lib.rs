@@ -1098,6 +1098,23 @@ fn process_strip(
         let db = volume_db_at(t, p) + trim.map_or(0.0, |l| l.value_at(p, 0.0)) + vca.map_or(0.0, |v| volume_db_at(v, p));
         db.min(12.0)
     });
+    // Track mute gates the audio and its pre-fader tap without splitting processor blocks.
+    // Keep the existing curve interpolation, first-lane and mode policy, and render-position
+    // clock. Processor/bus age and Master/VCA automation policy are separate concerns.
+    if t.mixer.automation_mode.reads()
+        && let Some(lane) = t.lane(&AutoParam::Mute).filter(|lane| !lane.points.is_empty())
+    {
+        for i in 0..frames {
+            let at = pos.saturating_add(i64::try_from(i).unwrap_or(i64::MAX));
+            if lane.value_at(at, 0.0) >= 0.5 {
+                for channel in strip.buf.iter_mut().chain(strip.pre.iter_mut()) {
+                    if let Some(sample) = channel.get_mut(i) {
+                        *sample = 0.0;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Fader gain is evaluated at the first and last sample of each cell of this many samples (cells
@@ -1125,23 +1142,6 @@ fn apply_fader(buf: &mut [Vec<f32>], frames: usize, pos: Samples, db_at: impl Fn
             }
         }
         i += n;
-    }
-    // Track mute gates the audio and its pre-fader tap without splitting processor blocks.
-    // Keep the existing curve interpolation, first-lane and mode policy, and render-position
-    // clock. Processor/bus age and Master/VCA automation policy are separate concerns.
-    if t.mixer.automation_mode.reads()
-        && let Some(lane) = t.lane(&AutoParam::Mute).filter(|lane| !lane.points.is_empty())
-    {
-        for i in 0..frames {
-            let at = pos.saturating_add(i64::try_from(i).unwrap_or(i64::MAX));
-            if lane.value_at(at, 0.0) >= 0.5 {
-                for channel in strip.buf.iter_mut().chain(strip.pre.iter_mut()) {
-                    if let Some(sample) = channel.get_mut(i) {
-                        *sample = 0.0;
-                    }
-                }
-            }
-        }
     }
 }
 
