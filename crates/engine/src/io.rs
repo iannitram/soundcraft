@@ -1497,6 +1497,22 @@ fn session_bundle_within(session: &Session, limits: BundleLimits) -> Result<(Vec
     let zerr = |err: zip::result::ZipError| EngineError::Io(format!("bundle: {err}"));
     let ioerr = |err: std::io::Error| EngineError::Io(format!("bundle: {err}"));
     let mut s = session.clone();
+    // Ours: refuse up front, before the audio is packed into memory, what `read_bundle` would
+    // refuse to open (upstream's count below refuses it too, once written). Audio is stored as
+    // 32-bit float WAV (4 bytes per sample).
+    let audio_bytes: u64 = s
+        .sources
+        .iter()
+        .filter(|x| s.pool.get(x.id).is_some())
+        .map(|x| x.frames.saturating_mul(u64::from(x.channels)).saturating_mul(4).saturating_add(4096))
+        .fold(0, u64::saturating_add);
+    if audio_bytes > BUNDLE_LIMITS.bytes {
+        return Err(EngineError::Unsupported(format!(
+            "bundle: the session's audio needs {} MB, more than a bundle can hold ({} MB, about 46 minutes of 48 kHz stereo)",
+            audio_bytes >> 20,
+            BUNDLE_LIMITS.bytes >> 20
+        )));
+    }
     let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored).large_file(true);
     // Sources whose audio is missing keep their old path; never hand that file name to another
