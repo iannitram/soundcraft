@@ -51,6 +51,10 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 use soundcraft_dsp::pan::{PanLaw, SpeakerPos, SurroundParams, gains};
+#[cfg(not(target_arch = "wasm32"))]
+mod readahead;
+#[cfg(not(target_arch = "wasm32"))]
+pub use readahead::{BLOCK_FRAMES, DEFAULT_RING_FRAMES, ReadAheadSource};
 use soundcraft_dsp::{Plugin, SampleSource, Transport, db_to_gain};
 use soundcraft_midi::CtrlKind;
 use soundcraft_model::{
@@ -1643,12 +1647,23 @@ mod click {
     }
 }
 
-fn render_clip(s: &Session, clip: &Clip, pos: Samples, frames: usize, buf: &mut [Vec<f32>], _scratch: &mut [f32]) {
+fn render_clip(s: &Session, clip: &Clip, pos: Samples, frames: usize, buf: &mut [Vec<f32>], scratch: &mut [f32]) {
     let ClipContent::Audio { source, offset } = clip.content else { return };
     let block = Range { start: pos, end: pos.saturating_add(frames as i64) };
     let Some(isect) = clip.range().intersect(&block) else { return };
-    let Some(audio) = s.pool.get(source) else { return };
-    let nsrc = audio.buffer.channels.len();
+    // In-RAM audio is read in place (the default). Anything else goes through the `SampleSource`
+    // trait. A streamed read may touch the disk and must never block the callback, so on the audio
+    // thread only a source that says it is `realtime_safe` (a `ReadAheadSource`, which serves
+    // pre-fetched blocks) is read; any other streamed source is silent there. Offline
+    // mixdown/bounce reads every source in chunks.
+    let ram = s.pool.get(source);
+    let rt = on_audio_thread();
+    let stream = if ram.is_some() { None } else { s.pool.get_source(source).filter(|st| !rt || st.realtime_safe()) };
+    let nsrc = match (&ram, &stream) {
+        (Some(a), _) => a.buffer.channels.len(),
+        (None, Some(st)) => st.channels(),
+        _ => return,
+    };
     if nsrc == 0 {
         return;
     }
@@ -1658,7 +1673,27 @@ fn render_clip(s: &Session, clip: &Clip, pos: Samples, frames: usize, buf: &mut 
     // Gain is evaluated every 32 samples and interpolated (fades and envelopes stay smooth).
     const STEP: usize = 32;
     for (ch, dst) in buf.iter_mut().enumerate() {
-        let src = audio.buffer.channels.get(ch % nsrc).map(Vec::as_slice).unwrap_or(&[]);
+        let window;
+        let (src, base): (&[f32], usize) = match (&ram, &stream) {
+            (Some(a), _) => (a.buffer.channels.get(ch % nsrc).map(Vec::as_slice).unwrap_or(&[]), 0),
+            (None, Some(st)) => {
+                let rel0 = pos.saturating_add(i0 as i64).saturating_sub(clip.start);
+                let rel1 = pos.saturating_add(i1 as i64).saturating_sub(clip.start);
+                let (lo, hi) = window_range(st.frames(), offset, stretch, rel0, rel1);
+                let len = hi.saturating_sub(lo) as usize;
+                if rt && len > 0 && len <= scratch.len() {
+                    // Audio thread: read the pre-fetched window into the strip's scratch (no allocation).
+                    let n = st.read(ch % nsrc, lo, &mut scratch[..len]).min(len);
+                    (&scratch[..n], lo as usize)
+                } else {
+                    // Offline, or a window larger than the scratch (a strong slow-down): allocate.
+                    window = stream_window(st.as_ref(), ch % nsrc, offset, stretch, rel0, rel1);
+                    (window.0.as_slice(), window.1)
+                }
+            }
+            _ => (&[], 0),
+        };
+        let at = |x: usize| x.checked_sub(base).and_then(|x| src.get(x)).copied().unwrap_or(0.0);
         let mut i = i0;
         while i < i1 {
             let seg_end = (i + STEP).min(i1);
@@ -1672,13 +1707,13 @@ fn render_clip(s: &Session, clip: &Clip, pos: Samples, frames: usize, buf: &mut 
             for k in i..seg_end {
                 let rel = pos.saturating_add(k as i64).saturating_sub(clip.start);
                 let v = if (stretch - 1.0).abs() < 1e-9 {
-                    usize::try_from(offset.saturating_add(rel)).ok().and_then(|x| src.get(x)).copied().unwrap_or(0.0)
+                    usize::try_from(offset.saturating_add(rel)).ok().map_or(0.0, at)
                 } else {
                     let f = offset as f64 + rel as f64 / stretch;
                     let x0 = f.floor();
                     let fr = (f - x0) as f32;
-                    let a = if x0 >= 0.0 { src.get(x0 as usize).copied().unwrap_or(0.0) } else { 0.0 };
-                    let b = if x0 + 1.0 >= 0.0 { src.get((x0 + 1.0) as usize).copied().unwrap_or(0.0) } else { 0.0 };
+                    let a = if x0 >= 0.0 { at(x0 as usize) } else { 0.0 };
+                    let b = if x0 + 1.0 >= 0.0 { at((x0 as usize).saturating_add(1)) } else { 0.0 };
                     a + (b - a) * fr
                 };
                 let t = (k - i) as f32 / n;
@@ -1689,6 +1724,28 @@ fn render_clip(s: &Session, clip: &Clip, pos: Samples, frames: usize, buf: &mut 
             i = seg_end;
         }
     }
+}
+
+/// Source frames `lo..hi` (clamped to `frames`) a clip render over clip-relative `rel0..rel1` can
+/// touch, with a little margin for interpolation.
+fn window_range(frames: u64, offset: i64, stretch: f64, rel0: i64, rel1: i64) -> (u64, u64) {
+    let lo = (offset as f64 + rel0 as f64 / stretch).floor() - 1.0;
+    let hi = (offset as f64 + rel1 as f64 / stretch).ceil() + 2.0;
+    (lo.max(0.0) as u64, (hi.max(0.0) as u64).min(frames))
+}
+
+/// Reads the part of one channel of a streamed source that a clip render over clip-relative
+/// frames `rel0..rel1` can touch (with a little margin for interpolation), returning the samples
+/// and the source frame the first one sits at. Offline renders only (it may block on disk).
+fn stream_window(st: &dyn soundcraft_model::SampleSource, ch: usize, offset: i64, stretch: f64, rel0: i64, rel1: i64) -> (Vec<f32>, usize) {
+    let (lo, hi) = window_range(st.frames(), offset, stretch, rel0, rel1);
+    if hi <= lo {
+        return (Vec::new(), 0);
+    }
+    let mut v = vec![0.0f32; (hi - lo) as usize];
+    let n = st.read(ch, lo, &mut v);
+    v.truncate(n);
+    (v, lo as usize)
 }
 
 /// The track's MIDI Track Offset (`midi.offset.<id>` in the edit values), in samples. Looked up
@@ -2592,6 +2649,103 @@ mod tests {
         lane.set_point(0, -48.0);
         tr.automation.push(lane);
         assert_eq!(render_range(&s, Range::new(0, 12_000), 512), reference);
+    }
+
+    /// Serves a ramp through the trait only (never in the pool's RAM map).
+    #[derive(Debug)]
+    struct Ramp(usize);
+    impl soundcraft_model::SampleSource for Ramp {
+        fn channels(&self) -> usize {
+            1
+        }
+        fn sample_rate(&self) -> u32 {
+            48_000
+        }
+        fn frames(&self) -> u64 {
+            self.0 as u64
+        }
+        fn read(&self, channel: usize, start: u64, out: &mut [f32]) -> usize {
+            if channel != 0 || start >= self.0 as u64 {
+                return 0;
+            }
+            let n = out.len().min(self.0 - start as usize);
+            for (k, o) in out[..n].iter_mut().enumerate() {
+                *o = (start as usize + k) as f32 / 1000.0;
+            }
+            n
+        }
+    }
+
+    fn ramp_session(streamed: bool, stretch: f64) -> (Session, TrackId) {
+        let mut s = Session::default();
+        let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+        let frames = 5000;
+        if streamed {
+            s.pool.insert_stream(SourceId(910), Arc::new(Ramp(frames)));
+        } else {
+            let ramp: Vec<f32> = (0..frames).map(|k| k as f32 / 1000.0).collect();
+            s.pool.insert(SourceId(910), Arc::new(SourceAudio::new(AudioBuffer { sample_rate: 48_000, channels: vec![ramp] })));
+        }
+        let id = s.new_clip_id();
+        if let Some(pl) = s.track_mut(t).and_then(|t| t.playlist_mut()) {
+            let mut c = Clip::audio(id, "ramp", SourceId(910), 100, 50, 3000);
+            c.stretch = stretch;
+            pl.clips.push(c);
+        }
+        (s, t)
+    }
+
+    #[test]
+    fn streamed_source_renders_like_in_ram_offline() {
+        for stretch in [1.0, 1.5] {
+            let (ram, t) = ramp_session(false, stretch);
+            let (stream, _) = ramp_session(true, stretch);
+            let r = Range::new(0, 4000);
+            let a = render_clips(&ram, t, r);
+            assert!(a[0].iter().any(|v| *v != 0.0));
+            assert_eq!(render_clips(&stream, t, r), a, "stretch {stretch}");
+            assert_eq!(render_range(&stream, r, 512), render_range(&ram, r, 512), "stretch {stretch}");
+        }
+    }
+
+    #[test]
+    fn streamed_source_without_read_ahead_is_silent_on_the_audio_thread() {
+        let (stream, t) = ramp_session(true, 1.0);
+        std::thread::spawn(move || {
+            mark_audio_thread();
+            assert!(render_clips(&stream, t, Range::new(0, 4000))[0].iter().all(|v| *v == 0.0));
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn read_ahead_source_plays_on_the_audio_thread_like_in_ram() {
+        for stretch in [1.0, 1.5] {
+            let (ram, t) = ramp_session(false, stretch);
+            let (mut stream, _) = ramp_session(true, stretch);
+            let ra = Arc::new(ReadAheadSource::new(Arc::new(Ramp(5000)), 4096));
+            stream.pool.insert_stream(SourceId(910), ra.clone());
+            let r = Range::new(0, 4000);
+            let want = render_clips(&ram, t, r);
+            assert!(want[0].iter().any(|v| *v != 0.0));
+            let ra2 = ra.clone();
+            std::thread::spawn(move || {
+                mark_audio_thread();
+                // First pass: the ring is cold, so it is silence plus underruns, then warm-up.
+                let _ = render_clips(&stream, t, r);
+                let t0 = std::time::Instant::now();
+                while ra2.prefetched_until(0) < 5000 && t0.elapsed().as_secs() < 10 {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                let before = ra2.underruns();
+                // Same range again: block by block, as the callback would.
+                assert_eq!(render_range(&stream, r, 512), render_range(&ram, r, 512), "stretch {stretch}");
+                assert_eq!(ra2.underruns(), before);
+            })
+            .join()
+            .unwrap();
+        }
     }
 
     fn session_with_dc(level: f32, frames: usize) -> (Session, TrackId) {

@@ -35,6 +35,8 @@ log = "0.4"
 # All date/time conversion goes through chrono (no hand-rolled calendar code beyond the 400-year range extension; AGENTS.md).
 chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 rayon = "1"
+# Lock-free SPSC ring for streamed-source read-ahead (MIT/Apache-2.0).
+rtrb = "0.3"
 proptest = "1"
 
 # audio

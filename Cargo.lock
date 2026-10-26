@@ -3519,6 +3519,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "rtrb"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fae8ee26b0371a29a77d2b2d6b3ae13aa81def6f9bf1b1b92a32d279a5e709b7"
+
+[[package]]
 name = "rustc-hash"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4100,6 +4106,7 @@ version = "0.13.1"
 dependencies = [
  "log",
  "rayon",
+ "rtrb",
  "soundcraft-au-host",
  "soundcraft-audio-io",
  "soundcraft-clap-host",
