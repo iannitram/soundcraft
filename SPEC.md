@@ -19,13 +19,13 @@ What our fork has or wants that upstream does not. "Send upstream" items still n
 
 | Item | Where | Disposition |
 |---|---|---|
-| Disk-backed sample source and read-ahead for streamed sources (offline mix reads through `SampleSource`) | commits e85de96, de5a3b5, 274f788 | send upstream (to confirm with the owner); also reused by WavCraft |
+| Disk-backed sample source and read-ahead for streamed sources (offline mix reads through `SampleSource`) | commits e85de96, de5a3b5, 274f788 | send upstream; also reused by WavCraft |
 | Correctness fixes found by our reviews (fades, crossfades, resample length, bounce caps, take files, BWF timestamps, Shuffle automation, ...) | ~40 commits ahead of upstream | send upstream, one at a time (#18 is the queue) |
 | Behaviour changes upstream documented differently: float headroom kept above full scale, mono-bus unity gain, render cap 2^31 samples | #17, #15 | keep on our fork until the owner decides |
 | PR CI on Linux, macOS and Windows (`.github/workflows/pr-ci.yml`) | e32bdc4 | send upstream (upstream G-14) |
 | MP3 export with our own clean-room encoder (craft-mp3) | #26 | keep on our fork |
 | Linux handheld track: benchmark baseline, build tuning, SIMD, GPU waveform/spectrogram, JACK/PipeWire, compatibility pass | #20-#25 | build tuning keeps on our fork; the rest send upstream where it measures faster |
-| Gamepad transport, pen and touch, NPU offload, speech enhancement, edit by transcript | #27-#31 | keep on our fork (to confirm with the owner) |
+| Gamepad transport, pen and touch, NPU offload, speech enhancement, edit by transcript | #27-#31 | keep on our fork |
 | Open bugs found by us | #4, #6-#12, #14, #46 | send upstream when fixed and tested |
 
 ## Won'ts (ours)
