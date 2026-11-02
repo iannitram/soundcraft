@@ -14,7 +14,7 @@ Describes commit: 33bfcca (2026-10-28). The workspace is 14 crates, 3 apps and `
 | `crates/model` | soundcraft-model | The session document: tracks, playlists, clips, mixer, routing, automation, markers (`.scraft`); the `SampleSource` trait and the disk-backed source behind clips (`source.rs`, ours in part) | pure, all |
 | `crates/dsp` | soundcraft-dsp | Built-in realtime plugins, meters, loudness, offline processing (reads sources through `dsp`'s own `SampleSource` trait; streamed offline passes are ours); the safe plugin trait the hosts implement | pure, all; SIMD paths must dispatch at runtime |
 | `crates/clap-host` | soundcraft-clap-host | Third-party CLAP hosting behind the dsp plugin trait | all; editors embedded on Windows and macOS |
-| `crates/vst3-host` | soundcraft-vst3-host | Third-party VST3 hosting | all; editors on macOS and Windows, not Linux (upstream PR #1127 adds X11) |
+| `crates/vst3-host` | soundcraft-vst3-host | Third-party VST3 hosting; `Vst3Plugin::reactivate()` flushes a plugin's internal state (ours) | all; editors on macOS and Windows, not Linux (upstream PR #1127 adds X11) |
 | `crates/au-host` | soundcraft-au-host | Audio Unit (AUv2) hosting | **macOS only**; no editor views yet (upstream PR #1050) |
 | `crates/video` | soundcraft-video | MP4/MOV demux, H.264/ProRes/MJPEG decode, thumbnails | pure, all |
 | `crates/mix` | soundcraft-mix | Renders a session (tracks, plugins, sends, busses, automation) to audio, offline and realtime; read-ahead for streamed sources over a lock-free ring (`readahead.rs`, ours) | all |

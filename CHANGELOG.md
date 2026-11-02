@@ -2,6 +2,7 @@
 
 Newest first. One line per change of stage, release or decision that the next session needs. Upstream's history is in ROADMAP.md's progress log.
 
+- 2026-11-01 vst3-host: `Vst3Plugin::reactivate()` flushes a hosted plugin's internal state (#57), for wavcraft#1070.
 - 2026-10-26 Delta marks approved by the owner as written; "to confirm" notes removed.
 - 2026-10-26 Normalized to pipeline v2 at Dev Loop: SPEC.md (upstream roadmap + our delta), docs/code-map.md, PIPELINE.md, AGENTS.fork.md; open issues sized; build issues filed for the alpha gate items upstream has no PR for. Upstream main merged (fbcbabc).
 - 2026-10-26 Branch sweep: `ours` folded into main; main is the integration branch.
