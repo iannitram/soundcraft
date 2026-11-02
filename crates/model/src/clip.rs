@@ -54,6 +54,9 @@ pub struct Fade {
     /// Continuous bend (-1..1); zero preserves the original shape exactly.
     #[serde(default)]
     pub curvature: f32,
+    /// Timeline cut before creating a crossfade. Plain fades and legacy sessions have none.
+    #[serde(default)]
+    pub original_edit_point: Option<Samples>,
 }
 
 impl Fade {
@@ -436,7 +439,7 @@ mod tests {
     #[test]
     fn fade_curvature_is_bounded_monotonic_and_inverts_at_the_midpoint() {
         for shape in FadeShape::ALL {
-            let original = Fade { len: 1000, shape, curvature: 0.0 };
+            let original = Fade { len: 1000, shape, curvature: 0.0, original_edit_point: None };
             for i in 0..=128 {
                 let t = i as f32 / 128.0;
                 assert_eq!(original.gain(t), shape.gain(t), "legacy curves must be unchanged");
@@ -463,6 +466,7 @@ mod tests {
     fn fade_curvature_loads_legacy_data_and_sanitizes_hostile_values() {
         let fade: Fade = serde_json::from_str(r#"{"len":100,"shape":"SCurve"}"#).unwrap();
         assert_eq!(fade.curvature, 0.0);
+        assert_eq!(fade.original_edit_point, None);
         for curvature in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -10.0, 10.0] {
             let mut fade = Fade { curvature, ..fade };
             assert!(fade.gain(0.5).is_finite());
@@ -474,15 +478,23 @@ mod tests {
     }
 
     #[test]
+    fn crossfade_original_edit_point_round_trips() {
+        let fade = Fade { len: 900, original_edit_point: Some(3000), ..Fade::default() };
+        let loaded: Fade = serde_json::from_str(&serde_json::to_string(&fade).unwrap()).unwrap();
+        assert_eq!(loaded, fade);
+        assert_eq!(Fade::default().original_edit_point, None);
+    }
+
+    #[test]
     fn temporary_fades_keep_clip_gain_and_envelope_without_mutating_the_clip() {
         let mut clip = Clip::audio(ClipId(1), "preview", SourceId(1), 0, 0, 1000);
         clip.gain_db = -6.0;
         clip.gain_env = vec![(0, 0.0), (1000, 6.0)];
-        clip.fade_in = Fade { len: 100, shape: FadeShape::SCurve, curvature: 0.25 };
-        clip.fade_out = Fade { len: 100, shape: FadeShape::Logarithmic, curvature: -0.1 };
+        clip.fade_in = Fade { len: 100, shape: FadeShape::SCurve, curvature: 0.25, original_edit_point: None };
+        clip.fade_out = Fade { len: 100, shape: FadeShape::Logarithmic, curvature: -0.1, original_edit_point: None };
         let before = clip.clone();
-        let fade_in = Fade { len: 1000, shape: FadeShape::Linear, curvature: 0.5 };
-        let fade_out = Fade { len: 1000, shape: FadeShape::Linear, curvature: -0.5 };
+        let fade_in = Fade { len: 1000, shape: FadeShape::Linear, curvature: 0.5, original_edit_point: None };
+        let fade_out = Fade { len: 1000, shape: FadeShape::Linear, curvature: -0.5, original_edit_point: None };
         assert!((clip.gain_at_with_fades(500, fade_in, fade_out) - db_to_gain(-3.0) * 0.16).abs() < 1e-6);
         let mut committed = clip.clone();
         committed.fade_in = fade_in;
@@ -503,8 +515,8 @@ mod tests {
     #[test]
     fn gain_with_fades() {
         let mut c = Clip::audio(ClipId(1), "a", SourceId(1), 0, 100, 1000);
-        c.fade_in = Fade { len: 100, shape: FadeShape::Linear, curvature: 0.0 };
-        c.fade_out = Fade { len: 100, shape: FadeShape::Linear, curvature: 0.0 };
+        c.fade_in = Fade { len: 100, shape: FadeShape::Linear, curvature: 0.0, original_edit_point: None };
+        c.fade_out = Fade { len: 100, shape: FadeShape::Linear, curvature: 0.0, original_edit_point: None };
         assert!(c.gain_at(0).abs() < 1e-6);
         assert!((c.gain_at(50) - 0.5).abs() < 1e-6);
         assert!((c.gain_at(500) - 1.0).abs() < 1e-6);
@@ -550,7 +562,7 @@ mod tests {
         assert_eq!(c.length, 1);
         // Regression: trimming the start must not leave a fade-out longer than the clip.
         let mut c = Clip::audio(ClipId(2), "b", SourceId(1), 0, 0, 1000);
-        c.fade_out = Fade { len: 800, shape: FadeShape::Linear, curvature: 0.0 };
+        c.fade_out = Fade { len: 800, shape: FadeShape::Linear, curvature: 0.0, original_edit_point: None };
         c.trim_start_to(900);
         assert!(c.fade_out.len <= c.length);
     }
@@ -559,17 +571,17 @@ mod tests {
     #[test]
     fn fades_never_overlap() {
         let mut c = Clip::audio(ClipId(1), "a", SourceId(1), 0, 0, 1000);
-        c.fade_in = Fade { len: 600, shape: FadeShape::Linear, curvature: 0.0 };
-        c.fade_out = Fade { len: 200, shape: FadeShape::Linear, curvature: 0.0 };
+        c.fade_in = Fade { len: 600, shape: FadeShape::Linear, curvature: 0.0, original_edit_point: None };
+        c.fade_out = Fade { len: 200, shape: FadeShape::Linear, curvature: 0.0, original_edit_point: None };
         c.trim_end_to(400);
         assert_eq!((c.fade_in.len, c.fade_out.len), (300, 100), "trimming shrinks both fades in proportion");
-        c.set_fade_in(Fade { len: 350, shape: FadeShape::Linear, curvature: 0.0 });
+        c.set_fade_in(Fade { len: 350, shape: FadeShape::Linear, curvature: 0.0, original_edit_point: None });
         assert_eq!((c.fade_in.len, c.fade_out.len), (350, 50), "a new fade-in shortens the fade-out");
-        c.set_fade_out(Fade { len: 1000, shape: FadeShape::Linear, curvature: 0.0 });
+        c.set_fade_out(Fade { len: 1000, shape: FadeShape::Linear, curvature: 0.0, original_edit_point: None });
         assert_eq!((c.fade_in.len, c.fade_out.len), (0, 400), "a new fade-out shortens the fade-in");
         let mut c = Clip::audio(ClipId(2), "b", SourceId(1), 0, 0, 1000);
-        c.fade_in = Fade { len: 1000, shape: FadeShape::Linear, curvature: 0.0 };
-        c.fade_out = Fade { len: 1000, shape: FadeShape::Linear, curvature: 0.0 };
+        c.fade_in = Fade { len: 1000, shape: FadeShape::Linear, curvature: 0.0, original_edit_point: None };
+        c.fade_out = Fade { len: 1000, shape: FadeShape::Linear, curvature: 0.0, original_edit_point: None };
         c.clamp_fades();
         assert!(c.fade_in.len + c.fade_out.len <= c.length);
         assert!(c.gain_at(500) > 0.99, "the middle of the clip stays at full level: {}", c.gain_at(500));

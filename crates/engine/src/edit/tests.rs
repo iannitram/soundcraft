@@ -30,8 +30,8 @@ fn clips(s: &Session, t: TrackId) -> Vec<(Samples, Samples, Samples)> {
 fn copy_range_resets_fades_at_cut_edges() {
     let (mut s, t) = session_with_clip();
     if let Some(c) = s.track_mut(t).and_then(|t| t.playlist_mut()).and_then(|p| p.clips.first_mut()) {
-        c.fade_in = Fade { len: 100, shape: FadeShape::Linear, curvature: 0.0 };
-        c.fade_out = Fade { len: 100, shape: FadeShape::Linear, curvature: 0.0 };
+        c.fade_in = Fade { len: 100, shape: FadeShape::Linear, curvature: 0.0, original_edit_point: None };
+        c.fade_out = Fade { len: 100, shape: FadeShape::Linear, curvature: 0.0, original_edit_point: None };
     }
     let fades = |r: Range| -> Vec<(Samples, Samples)> { copy_range(&s, t, r).iter().map(|c| (c.fade_in.len, c.fade_out.len)).collect() };
     assert_eq!(fades(Range::new(2000, 3000)), vec![(0, 0)]);
@@ -375,6 +375,58 @@ fn moves_overwrite_and_respect_locks() {
 }
 
 #[test]
+fn delete_fades_restores_the_original_cut_for_unequal_halves() {
+    for range in [Range::new(2800, 3700), Range::new(2300, 3200), Range::new(2500, 3500)] {
+        let (mut s, t) = session_with_clip();
+        assert_eq!(separate_at(&mut s, t, 3000), 1);
+        let original = clips(&s, t);
+        assert_eq!(create_fades(&mut s, t, range, FadeShape::EqualPower), 1);
+        let pair = s.track(t).unwrap().clips();
+        assert_eq!(pair[0].fade_out.original_edit_point, Some(3000));
+        assert_eq!(pair[1].fade_in.original_edit_point, Some(3000));
+        // The saved cut must survive closing and reopening the session.
+        s = Session::from_json(&s.to_json().unwrap()).unwrap();
+        assert_eq!(delete_fades(&mut s, t, range), 2);
+        assert_eq!(clips(&s, t), original, "selection {range:?}");
+        assert!(s.track(t).unwrap().clips().iter().all(|c| c.fade_in == Fade::default() && c.fade_out == Fade::default()));
+    }
+}
+
+#[test]
+fn delete_fades_loads_legacy_sessions_and_keeps_midpoint_behavior() {
+    let (mut s, t) = session_with_clip();
+    separate_at(&mut s, t, 3000);
+    let range = Range::new(2800, 3700);
+    create_fades(&mut s, t, range, FadeShape::EqualPower);
+    let mut legacy = serde_json::to_value(&s).unwrap();
+    for clip in legacy["tracks"][0]["playlists"][0]["clips"].as_array_mut().unwrap() {
+        for side in ["fade_in", "fade_out"] {
+            clip[side].as_object_mut().unwrap().remove("original_edit_point");
+        }
+    }
+    let mut loaded = Session::from_json(&legacy.to_string()).unwrap();
+    assert!(loaded.track(t).unwrap().clips().iter().all(|c| c.fade_in.original_edit_point.is_none() && c.fade_out.original_edit_point.is_none()));
+    assert_eq!(delete_fades(&mut loaded, t, range), 2);
+    assert_eq!(clips(&loaded, t), vec![(1000, 2250, 1000), (3250, 1750, 3250)]);
+}
+
+#[test]
+fn delete_fades_uses_either_half_and_rejects_invalid_saved_cuts() {
+    for (out_cut, in_cut, expected) in [(Some(3000), None, 3000), (None, Some(3000), 3000), (Some(i64::MAX), Some(i64::MIN), 3250)] {
+        let (mut s, t) = session_with_clip();
+        separate_at(&mut s, t, 3000);
+        let range = Range::new(2800, 3700);
+        create_fades(&mut s, t, range, FadeShape::EqualPower);
+        let pair = &mut s.track_mut(t).unwrap().playlist_mut().unwrap().clips;
+        pair[0].fade_out.original_edit_point = out_cut;
+        pair[1].fade_in.original_edit_point = in_cut;
+        assert_eq!(delete_fades(&mut s, t, range), 2);
+        let pair = s.track(t).unwrap().clips();
+        assert_eq!((pair[0].end(), pair[1].start), (expected, expected));
+    }
+}
+
+#[test]
 fn delete_fades_keeps_playlist_sorted_when_a_clip_overlaps_several() {
     let (mut s, t) = session_with_clip();
     let pl = s.track_mut(t).and_then(|t| t.playlist_mut()).expect("track has a playlist");
@@ -396,8 +448,8 @@ fn delete_fades_leaves_unrelated_overlaps_alone() {
         pl.clips.clear();
         for (id, start, len) in [(ids[0], 0, 1100), (ids[1], 1000, 1000), (ids[2], 5000, 1100), (ids[3], 6000, 1000)] {
             let mut c = Clip::audio(id, "c", SourceId(500), start, start, len);
-            c.fade_in = Fade { len: 100, shape: FadeShape::Linear, curvature: 0.0 };
-            c.fade_out = Fade { len: 100, shape: FadeShape::Linear, curvature: 0.0 };
+            c.fade_in = Fade { len: 100, shape: FadeShape::Linear, curvature: 0.0, original_edit_point: None };
+            c.fade_out = Fade { len: 100, shape: FadeShape::Linear, curvature: 0.0, original_edit_point: None };
             pl.clips.push(c);
         }
     }
@@ -414,9 +466,9 @@ fn paste_keeps_crossfade_overlap() {
     if let Some(pl) = s.track_mut(t).and_then(|t| t.playlist_mut()) {
         pl.clips.clear();
         let mut ca = Clip::audio(a, "a", SourceId(500), 0, 1000, 2000);
-        ca.fade_out = Fade { len: 500, shape: FadeShape::Linear, curvature: 0.0 };
+        ca.fade_out = Fade { len: 500, shape: FadeShape::Linear, curvature: 0.0, original_edit_point: None };
         let mut cb = Clip::audio(b, "b", SourceId(500), 0, 2500, 2500);
-        cb.fade_in = Fade { len: 500, shape: FadeShape::Linear, curvature: 0.0 };
+        cb.fade_in = Fade { len: 500, shape: FadeShape::Linear, curvature: 0.0, original_edit_point: None };
         pl.clips.push(ca);
         pl.clips.push(cb);
         pl.sort();

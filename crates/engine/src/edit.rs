@@ -889,12 +889,12 @@ pub fn create_fades(s: &mut Session, track: TrackId, range: Range, shape: FadeSh
             let (out_len, in_len) = if ext_a + ext_b > 0 { (ext_a + ext_b, ext_a + ext_b) } else { (before, after) };
             if let Some(ca) = pl.clips.get_mut(i) {
                 ca.length += ext_a;
-                ca.set_fade_out(Fade { len: out_len.min(ca.length), shape, curvature: 0.0 });
+                ca.set_fade_out(Fade { len: out_len.min(ca.length), shape, curvature: 0.0, original_edit_point: Some(boundary) });
             }
             if let Some(cb) = pl.clips.get_mut(i + 1) {
                 let old = cb.start;
                 cb.trim_start_to(old - ext_b);
-                cb.set_fade_in(Fade { len: in_len.min(cb.length), shape, curvature: 0.0 });
+                cb.set_fade_in(Fade { len: in_len.min(cb.length), shape, curvature: 0.0, original_edit_point: Some(boundary) });
             }
             made += 1;
             xfaded.push(a.id);
@@ -903,10 +903,10 @@ pub fn create_fades(s: &mut Session, track: TrackId, range: Range, shape: FadeSh
     }
     for c in pl.clips.iter_mut().filter(|c| !xfaded.contains(&c.id)) {
         if range.start <= c.start && range.end > c.start && range.end < c.end() {
-            c.set_fade_in(Fade { len: range.end - c.start, shape, curvature: 0.0 });
+            c.set_fade_in(Fade { len: range.end - c.start, shape, curvature: 0.0, original_edit_point: None });
             made += 1;
         } else if range.end >= c.end() && range.start > c.start && range.start < c.end() {
-            c.set_fade_out(Fade { len: c.end() - range.start, shape, curvature: 0.0 });
+            c.set_fade_out(Fade { len: c.end() - range.start, shape, curvature: 0.0, original_edit_point: None });
             made += 1;
         }
     }
@@ -917,10 +917,10 @@ pub fn create_fades(s: &mut Session, track: TrackId, range: Range, shape: FadeSh
 pub fn delete_fades(s: &mut Session, track: TrackId, range: Range) -> usize {
     let Some(pl) = s.track_mut(track).and_then(|t| t.playlist_mut()) else { return 0 };
     let mut n = 0;
-    let mut touched: HashSet<ClipId> = HashSet::new();
+    let mut touched: HashMap<ClipId, (Fade, Fade)> = HashMap::new();
     for c in &mut pl.clips {
         if c.range().overlaps(&range) || (range.is_empty() && c.range().contains(range.start)) {
-            touched.insert(c.id);
+            touched.insert(c.id, (c.fade_in, c.fade_out));
             if c.fade_in.len > 0 || c.fade_out.len > 0 {
                 n += 1;
             }
@@ -928,18 +928,28 @@ pub fn delete_fades(s: &mut Session, track: TrackId, range: Range) -> usize {
             c.fade_out = Fade::default();
         }
     }
-    // Overlapping (crossfaded) neighbours in the range are trimmed back to the midpoint; other overlaps stay as they are.
+    // Restore the cut saved on either crossfade half. Legacy fades retain midpoint trimming;
+    // overlaps outside the selection stay as they are.
     pl.sort();
     for i in 0..pl.clips.len().saturating_sub(1) {
-        let (Some(a_end), Some(b_start)) = (pl.clips.get(i).map(Clip::end), pl.clips.get(i + 1).map(|c| c.start)) else { continue };
-        let in_range = pl.clips.get(i).is_some_and(|a| touched.contains(&a.id)) || pl.clips.get(i + 1).is_some_and(|b| touched.contains(&b.id));
+        let (Some(a), Some(b)) = (pl.clips.get(i), pl.clips.get(i + 1)) else { continue };
+        let (a_end, b_start) = (a.end(), b.start);
+        let in_range = touched.contains_key(&a.id) || touched.contains_key(&b.id);
         if in_range && a_end > b_start {
-            let mid = b_start + (a_end - b_start) / 2;
+            // Session data can be stale or hostile: only use a saved cut inside the overlap
+            // that leaves both clips nonempty.
+            let valid_cut = |cut: &Samples| *cut >= b_start && *cut <= a_end && *cut > a.start && *cut < b.end();
+            let cut = touched
+                .get(&a.id)
+                .and_then(|(_, fade)| fade.original_edit_point)
+                .filter(valid_cut)
+                .or_else(|| touched.get(&b.id).and_then(|(fade, _)| fade.original_edit_point).filter(valid_cut))
+                .unwrap_or_else(|| b_start + (a_end - b_start) / 2);
             if let Some(a) = pl.clips.get_mut(i) {
-                a.trim_end_to(mid);
+                a.trim_end_to(cut);
             }
             if let Some(b) = pl.clips.get_mut(i + 1) {
-                b.trim_start_to(mid);
+                b.trim_start_to(cut);
             }
         }
     }
