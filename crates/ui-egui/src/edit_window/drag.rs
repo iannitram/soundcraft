@@ -25,6 +25,7 @@ pub(super) fn fade_drag_preview(clip: &Clip, fade_in: bool, to: Samples) -> Opti
         len: range.end.saturating_sub(range.start),
         shape: if original.len > 0 { original.shape } else { soundcraft_model::FadeShape::SCurve },
         curvature: if original.len > 0 { original.curvature } else { 0.0 },
+        original_edit_point: None,
     })
 }
 

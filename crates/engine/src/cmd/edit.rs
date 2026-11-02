@@ -891,7 +891,7 @@ fn fades_create(e: &mut Engine, p: &Value) -> Result<Value> {
         if available <= 0 {
             return Err(bad("edit.fades_create", "clip has no length"));
         }
-        let fade = Fade { len: length.min(available), shape, curvature };
+        let fade = Fade { len: length.min(available), shape, curvature, original_edit_point: None };
         let clip = e.session_mut().find_clip_mut(id).ok_or_else(|| bad("edit.fades_create", "clip not found"))?;
         if fade_in {
             clip.fade_in = fade;
@@ -1025,6 +1025,25 @@ mod tests {
     use soundcraft_model::{ChannelFormat, Clip, ClipContent, SourceId, TrackId, TrackKind};
 
     #[test]
+    fn deleting_asymmetric_crossfade_undoes_and_redoes_the_cut_and_fades() {
+        let (mut e, t, _) = trim_session(&[(1000, 2000, 1000), (3000, 2000, 3000)]);
+        let original = e.session().track(t).unwrap().clips().to_vec();
+        let params = json!({"tracks": [t.0], "start": 2800, "end": 3700});
+        e.execute("edit.fades_create", &params).unwrap();
+        let crossfaded = e.session().track(t).unwrap().clips().to_vec();
+        assert_eq!(crossfaded[0].fade_out.original_edit_point, Some(3000));
+        assert_eq!(crossfaded[1].fade_in.original_edit_point, Some(3000));
+        let undo_len = e.undo_history().len();
+        e.execute("edit.fades_delete", &params).unwrap();
+        assert_eq!(e.session().track(t).unwrap().clips(), original);
+        assert_eq!(e.undo_history().len(), undo_len + 1);
+        assert!(e.undo());
+        assert_eq!(e.session().track(t).unwrap().clips(), crossfaded);
+        assert!(e.redo());
+        assert_eq!(e.session().track(t).unwrap().clips(), original);
+    }
+
+    #[test]
     fn targeted_fade_curvature_saves_reopens_and_undoes_without_changing_lengths() {
         for side in ["in", "out"] {
             let mut e = crate::demo::demo_engine();
@@ -1072,7 +1091,7 @@ mod tests {
             );
             let mut expected = before.clone();
             let c = expected.find_clip_mut(clip.id).unwrap();
-            let fade = Fade { len: clip.length, shape: FadeShape::SCurve, curvature: 0.0 };
+            let fade = Fade { len: clip.length, shape: FadeShape::SCurve, curvature: 0.0, original_edit_point: None };
             if side == "in" {
                 c.fade_in = fade;
             } else {
