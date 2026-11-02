@@ -1713,7 +1713,7 @@ fn render_clip(s: &Session, clip: &Clip, pos: Samples, frames: usize, buf: &mut 
                     let x0 = f.floor();
                     let fr = (f - x0) as f32;
                     let a = if x0 >= 0.0 { at(x0 as usize) } else { 0.0 };
-                    let b = if x0 + 1.0 >= 0.0 { at((x0 as usize).saturating_add(1)) } else { 0.0 };
+                    let b = if x0 + 1.0 >= 0.0 { at((x0 + 1.0) as usize) } else { 0.0 };
                     a + (b - a) * fr
                 };
                 let t = (k - i) as f32 / n;
