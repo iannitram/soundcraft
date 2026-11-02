@@ -655,8 +655,9 @@ fn fade_waveform_case(channels: usize, fade_in: bool, bend: bool, mode: &str) {
         len: if bend { c.length * 2 / 3 } else { c.length / 4 },
         shape: soundcraft_model::FadeShape::SCurve,
         curvature: 0.0,
+        original_edit_point: None,
     };
-    let other = soundcraft_model::Fade { len: c.length / 8, shape: soundcraft_model::FadeShape::Linear, curvature: 0.2 };
+    let other = soundcraft_model::Fade { len: c.length / 8, shape: soundcraft_model::FadeShape::Linear, curvature: 0.2, original_edit_point: None };
     (c.fade_in, c.fade_out) = if fade_in { (target, other) } else { (other, target) };
     h.step();
     let before = h.state().engine.session().clone();
@@ -771,7 +772,12 @@ fn fade_drag_previews_and_commits_stay_inside_the_clip() {
             let range = fade_drag_range(&clip, fade_in, sample_at(&before, tl, release.x)).unwrap();
             let mut expected = before.clone();
             let c = expected.find_clip_mut(clip.id).unwrap();
-            let fade = soundcraft_model::Fade { len: range.end - range.start, shape: soundcraft_model::FadeShape::SCurve, curvature: 0.0 };
+            let fade = soundcraft_model::Fade {
+                len: range.end - range.start,
+                shape: soundcraft_model::FadeShape::SCurve,
+                curvature: 0.0,
+                original_edit_point: None,
+            };
             if fade_in {
                 c.fade_in = fade;
             } else {
@@ -801,8 +807,14 @@ fn a_fade_drag_replaces_the_old_curve_and_matches_the_released_curve() {
             let tl = timeline(&h);
             let (clip, lane) = clip_on_screen(&h, |xs, xe| xs > tl.min.x + 30.0 && xe < tl.max.x - 100.0 && xe - xs > 100.0);
             let c = h.state_mut().engine.session_mut().find_clip_mut(clip.id).unwrap();
-            c.fade_in = soundcraft_model::Fade { len: c.length / 8, shape: soundcraft_model::FadeShape::Linear, curvature: 0.0 };
-            c.fade_out = soundcraft_model::Fade { len: c.length / 8, shape: soundcraft_model::FadeShape::EqualPower, curvature: 0.0 };
+            c.fade_in =
+                soundcraft_model::Fade { len: c.length / 8, shape: soundcraft_model::FadeShape::Linear, curvature: 0.0, original_edit_point: None };
+            c.fade_out = soundcraft_model::Fade {
+                len: c.length / 8,
+                shape: soundcraft_model::FadeShape::EqualPower,
+                curvature: 0.0,
+                original_edit_point: None,
+            };
             h.step();
             let s = h.state().engine.session();
             let (xs, xe) = (x_of(s, tl, clip.start), x_of(s, tl, clip.end()));
@@ -846,7 +858,7 @@ fn fade_curve_sampling_keeps_steep_bends_below_a_quarter_pixel_error() {
             for shape in soundcraft_model::FadeShape::ALL {
                 for curvature in [-1.0, 1.0] {
                     for fade_in in [true, false] {
-                        let fade = soundcraft_model::Fade { len: 1000, shape, curvature };
+                        let fade = soundcraft_model::Fade { len: 1000, shape, curvature, original_edit_point: None };
                         let points = fade_curve_points(fade, fade_in, 0.0, width, body, scale);
                         assert!(points.len() > 17 && points.len() <= 4097);
                         assert_eq!((points.len() - 1) % 2, 0);
@@ -884,7 +896,7 @@ fn narrow_fades_take_few_points_and_stay_within_a_quarter_pixel() {
             for scale in [1.0, 2.0] {
                 for shape in soundcraft_model::FadeShape::ALL {
                     for curvature in [-1.0, 0.0, 1.0] {
-                        let fade = soundcraft_model::Fade { len: 1000, shape, curvature };
+                        let fade = soundcraft_model::Fade { len: 1000, shape, curvature, original_edit_point: None };
                         let points = fade_curve_points(fade, true, 0.0, width, body, scale);
                         assert!(points.len() <= ((width * scale * 4.0).ceil() as usize + 4), "{width} wide: {} points", points.len());
                         assert_eq!((points.len() - 1) % 2, 0, "an exact midpoint");
@@ -943,7 +955,7 @@ fn fade_midpoint_handles_remain_visible_and_can_be_grabbed_again() {
                     h.state_mut().engine.execute("view.zoom_set", &json!({"samples_per_px": spp})).unwrap();
                     h.state_mut().engine.execute("view.scroll", &json!({"to": clip.start - clip.length / 5})).unwrap();
                     let c = h.state_mut().engine.session_mut().find_clip_mut(clip.id).unwrap();
-                    let fade = soundcraft_model::Fade { len: c.length * 2 / 3, shape, curvature: 0.0 };
+                    let fade = soundcraft_model::Fade { len: c.length * 2 / 3, shape, curvature: 0.0, original_edit_point: None };
                     if fade_in {
                         c.fade_in = fade;
                     } else {
@@ -1035,8 +1047,9 @@ fn fade_midpoint_bend_case(fade_in: bool, show_name: bool, dy: f32) {
     let tl = timeline(&h);
     let (clip, lane) = clip_on_screen(&h, |xs, xe| xs > tl.min.x + 30.0 && xe < tl.max.x - 100.0 && xe - xs > 100.0);
     let c = h.state_mut().engine.session_mut().find_clip_mut(clip.id).unwrap();
-    let target = soundcraft_model::Fade { len: c.length * 2 / 3, shape: soundcraft_model::FadeShape::SCurve, curvature: 0.0 };
-    let other = soundcraft_model::Fade { len: c.length / 8, shape: soundcraft_model::FadeShape::Linear, curvature: -0.2 };
+    let target =
+        soundcraft_model::Fade { len: c.length * 2 / 3, shape: soundcraft_model::FadeShape::SCurve, curvature: 0.0, original_edit_point: None };
+    let other = soundcraft_model::Fade { len: c.length / 8, shape: soundcraft_model::FadeShape::Linear, curvature: -0.2, original_edit_point: None };
     (c.fade_in, c.fade_out) = if fade_in { (target, other) } else { (other, target) };
     h.step();
     let before = h.state().engine.session().clone();
@@ -1115,7 +1128,8 @@ fn fade_curve_drags_cancel_safely_or_return_to_the_original_curve() {
         let tl = timeline(&h);
         let (clip, lane) = clip_on_screen(&h, |xs, xe| xs > tl.min.x + 30.0 && xe < tl.max.x - 100.0 && xe - xs > 100.0);
         let c = h.state_mut().engine.session_mut().find_clip_mut(clip.id).unwrap();
-        c.fade_out = soundcraft_model::Fade { len: c.length * 2 / 3, shape: soundcraft_model::FadeShape::SCurve, curvature: 0.0 };
+        c.fade_out =
+            soundcraft_model::Fade { len: c.length * 2 / 3, shape: soundcraft_model::FadeShape::SCurve, curvature: 0.0, original_edit_point: None };
         h.step();
         let midpoint = fade_midpoint(h.state().engine.session(), tl, lane, h.state().engine.session().find_clip(clip.id).unwrap().1, false).unwrap();
         let before = h.state().engine.session().clone();
@@ -1154,7 +1168,7 @@ fn existing_fades_drag_from_their_upper_curve_endpoints() {
                 let (clip, lane) = clip_on_screen(&h, |xs, xe| xs > tl.min.x + 30.0 && xe < tl.max.x - 100.0 && xe - xs > 100.0);
                 let len = if full_length { clip.length } else { clip.length * 2 / 3 };
                 let c = h.state_mut().engine.session_mut().find_clip_mut(clip.id).unwrap();
-                let fade = soundcraft_model::Fade { len, shape: soundcraft_model::FadeShape::SCurve, curvature: 0.35 };
+                let fade = soundcraft_model::Fade { len, shape: soundcraft_model::FadeShape::SCurve, curvature: 0.35, original_edit_point: None };
                 if fade_in {
                     c.fade_in = fade;
                 } else {
@@ -1201,7 +1215,12 @@ fn existing_fades_drag_from_their_upper_curve_endpoints() {
                 let range = fade_drag_range(&clip, fade_in, sample_at(&before, tl, to.x)).unwrap();
                 let mut expected = before.clone();
                 let c = expected.find_clip_mut(clip.id).unwrap();
-                let fade = soundcraft_model::Fade { len: range.end - range.start, shape: soundcraft_model::FadeShape::SCurve, curvature: 0.35 };
+                let fade = soundcraft_model::Fade {
+                    len: range.end - range.start,
+                    shape: soundcraft_model::FadeShape::SCurve,
+                    curvature: 0.35,
+                    original_edit_point: None,
+                };
                 assert!(fade.len < len);
                 if fade_in {
                     c.fade_in = fade;
@@ -1223,7 +1242,7 @@ fn existing_fade_handles_preserve_selector_and_other_smart_tool_zones() {
     let tl = timeline(&h);
     let (clip, lane) = clip_on_screen(&h, |xs, xe| xs > tl.min.x + 30.0 && xe < tl.max.x - 100.0 && xe - xs > 100.0);
     let c = h.state_mut().engine.session_mut().find_clip_mut(clip.id).unwrap();
-    c.fade_out = soundcraft_model::Fade { len: c.length / 2, shape: soundcraft_model::FadeShape::SCurve, curvature: 0.0 };
+    c.fade_out = soundcraft_model::Fade { len: c.length / 2, shape: soundcraft_model::FadeShape::SCurve, curvature: 0.0, original_edit_point: None };
     h.step();
     let s = h.state().engine.session();
     let rect = Rect::from_min_max(pos2(x_of(s, tl, clip.start), lane.min.y), pos2(x_of(s, tl, clip.end()), lane.max.y));
