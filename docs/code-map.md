@@ -2,23 +2,23 @@
 
 The code is upstream's Cargo workspace (`Cargo.toml` members). Upstream's own design notes are in `docs/` (start with `docs/control-protocol.md`, `docs/hardware-parity.md`, `docs/plugin-parity.md`). This map is ours: what each module owns, how they connect, and what differs per platform (R04). The quality gate for every module is `cargo xtask ci`.
 
-Describes commit: 76ce08a (2026-11-02). The workspace is 14 crates, 3 apps and `xtask` (version 0.16.0), on branch `main`. Upstream owns every crate and file except the changes listed under "Where our delta lives"; at this commit ours contains all of upstream `main` (8444edf: 0 behind) and is 118 commits ahead of it.
+Describes commit: 54fcdd2 (2026-11-02). The workspace is 14 crates, 3 apps and `xtask` (version 0.16.0), on branch `main`. Upstream owns every crate and file except the changes listed under "Where our delta lives"; at this commit ours is 128 commits ahead of upstream `main` and 18 behind (the merge base is 8444edf), so the next sync is still to do.
 
 ## Modules
 
 | Path | Crate | Owns | Platform notes |
 |---|---|---|---|
 | `crates/time` | soundcraft-time | Timebases: samples, Bars\|Beats, Min:Secs, Timecode, Feet+Frames, tempo and meter maps, grid | pure, all |
-| `crates/audio-io` | soundcraft-audio-io | Audio file I/O: WAV/BWF/RF64, AIFF/AIFF-C, FLAC encoder, symphonia decoders; streamed PCM reads for the disk-backed sources (`pcm.rs`, ours in part) | pure, all |
+| `crates/audio-io` | soundcraft-audio-io | Audio file I/O: WAV/BWF/RF64, AIFF/AIFF-C, FLAC encoder, symphonia decoders; streamed PCM reads for the disk-backed sources (`crates/audio-io/src/pcm.rs`, ours in part) | pure, all |
 | `crates/midi` | soundcraft-midi | Note/controller sequences, SMF import/export, MIDI editing, GM names. No device I/O yet (G-02) | pure, all; device layer will be per OS (CoreMIDI, WinMM, ALSA) |
-| `crates/model` | soundcraft-model | The session document: tracks, playlists, clips, mixer, routing, automation, markers (`.scraft`); the `SampleSource` trait and the disk-backed source behind clips (`source.rs`, ours in part) | pure, all |
+| `crates/model` | soundcraft-model | The session document: tracks, playlists, clips, mixer, routing, automation, markers (`.scraft`); the `SampleSource` trait and the disk-backed source behind clips (`crates/model/src/source.rs`, ours in part) | pure, all |
 | `crates/dsp` | soundcraft-dsp | Built-in realtime plugins, meters, loudness, offline processing (reads sources through `dsp`'s own `SampleSource` trait; streamed offline passes are ours); the safe plugin trait the hosts implement | pure, all; SIMD paths must dispatch at runtime |
 | `crates/clap-host` | soundcraft-clap-host | Third-party CLAP hosting behind the dsp plugin trait | all; editors embedded on Windows and macOS |
 | `crates/vst3-host` | soundcraft-vst3-host | Third-party VST3 hosting; `Vst3Plugin::reactivate()` flushes a plugin's internal state (ours) | all; editors on macOS and Windows, not Linux (upstream PR #1127 adds X11) |
 | `crates/au-host` | soundcraft-au-host | Audio Unit (AUv2) hosting | **macOS only**; no editor views yet (upstream PR #1050) |
 | `crates/video` | soundcraft-video | MP4/MOV demux, H.264/ProRes/MJPEG decode, thumbnails | pure, all |
-| `crates/mix` | soundcraft-mix | Renders a session (tracks, plugins, sends, busses, automation) to audio, offline and realtime; read-ahead for streamed sources over a lock-free ring (`readahead.rs`, ours) | all |
-| `crates/engine` | soundcraft-engine | Command engine: commands, undo, editing, import/export, bounce, parity catalog; `examples/bench.rs` benchmark (ours) | all |
+| `crates/mix` | soundcraft-mix | Renders a session (tracks, plugins, sends, busses, automation) to audio, offline and realtime; read-ahead for streamed sources over a lock-free ring (`crates/mix/src/readahead.rs`, ours) | all |
+| `crates/engine` | soundcraft-engine | Command engine: commands, undo, editing, import/export, bounce, parity catalog; `crates/engine/examples/bench.rs` benchmark (ours) | all |
 | `crates/playback` | soundcraft-playback | Realtime device I/O through cpal: playback, recording, input monitoring | per OS: CoreAudio, WASAPI (ASIO behind the opt-in `asio` feature), ALSA/PulseAudio; no JACK yet (#24) |
 | `crates/automation` | soundcraft-automation | Agent control: MCP server (stdio JSON-RPC), headless backend, control channel | all |
 | `crates/ui-egui` | soundcraft-ui-egui | Edit and Mix windows, transport, dialogs, docking, control channel | all; macOS system menu bar, Windows DX12 default, Linux fontconfig |
@@ -46,11 +46,11 @@ Upstream's layer rule (checked by `cargo xtask ci`): lower crates never depend o
 
 ## Where our delta lives
 
-`git diff --stat upstream/main HEAD` at the describes commit touches 45 files: 32 under `crates/` and `.github/` (+2,347 / -135), and 13 more (docs, pipeline files, `Cargo.toml`, the lock file, the CLI behaviour tests and CHANGELOG). The main areas: `crates/model/src/source.rs` and `clip.rs` (disk-backed sources, fade clamping), `crates/mix/` (read-ahead in `readahead.rs`, clips, pan, strip, tests), `crates/audio-io/src/{lib,pcm}.rs`, `crates/dsp/src/{offline,meter}.rs`, `crates/engine/src/{edit,io}.rs`, `io/{bundle,import,record}.rs`, `cmd/edit.rs`, `cmd/audiosuite.rs` and `examples/bench.rs`, `crates/playback/src/{callback,record,tests}.rs`, `crates/vst3-host/` (plugin, instance, tests and fixture), `.github/workflows/pr-ci.yml`, and the `rtrb` dependency and `max` profile in `Cargo.toml`. Not yet in the tree: the MP3 encoder, the Linux handheld work (JACK/PipeWire, SIMD, GPU waveforms) and the gamepad/pen/NPU items in `SPEC.md`.
+`git diff --stat` from the merge base with upstream to the describes commit touches 52 files (+2,816 / -184): 38 under `crates/` and `.github/` (+2,548 / -176), and 14 more (docs, pipeline files, `Cargo.toml`, `AGENTS.md`). The main areas: `crates/model/src/source.rs` and `clip.rs` (disk-backed sources, fade clamping, the saved crossfade original edit point, #7), `crates/mix/` (read-ahead in `src/readahead.rs`, clips, pan, strip, tests), `crates/audio-io/src/{lib,pcm}.rs`, `crates/dsp/src/{offline,meter}.rs`, `crates/engine/src/{edit,io}.rs`, `src/io/{bundle,import,record}.rs`, `src/cmd/{edit,audiosuite,clip_more}.rs`, `examples/bench.rs` and the conform-after-edit test `tests/it/conform_after_edit.rs`, `crates/playback/src/{callback,record,tests}.rs`, `crates/vst3-host/` (plugin, instance, tests and fixture), `.github/workflows/pr-ci.yml`, and the `rtrb` dependency and `max` profile in `Cargo.toml`. Not yet in the tree: the MP3 encoder, the Linux handheld work (JACK/PipeWire, SIMD, GPU waveforms) and the gamepad/pen/NPU items in `SPEC.md`.
 
 ## Mac, PC and Linux
 
-- CI: `pr-ci.yml` (ours) runs `cargo xtask ci` on Linux and `cargo test --workspace` on macOS (macos-14) and Windows (windows-2022) for every pull request that touches more than docs; on the last upstream-sync pull request the Windows test leg failed. Upstream's `ci.yml` (push to `main` and pull requests) is enabled on our fork but has not run yet; `sonarcloud.yml`, `nix.yml` and `packaging-lint.yml` run on push to `main` and on pull requests (the last two only for their own paths); `freebsd.yml` and `windows-arm64.yml` run nightly and on pushes to `release`; `release.yml` runs on pushes to `release`.
+- CI: `pr-ci.yml` (ours) runs `cargo xtask ci` on Linux and `cargo test --workspace` on macOS (macos-14) and Windows (windows-2022) for every pull request that touches more than docs; Upstream's `ci.yml` (push to `main` and pull requests) is enabled on our fork and was green on `main` on 2026-11-02; `sonarcloud.yml`, `nix.yml` and `packaging-lint.yml` run on push to `main` and on pull requests (the last two only for their own paths); `freebsd.yml` and `windows-arm64.yml` run nightly and on pushes to `release`; `release.yml` runs on pushes to `release`.
 - Platform-specific code is behind `cfg(target_os)`: au-host (macOS), plugin editor windows (HWND, NSView, X11), audio backends (playback), menu bar (macOS). A change there needs the `platform:*` label.
 - Paths: plugin search paths and preferences folders differ per OS; tests never load installed plugins.
 - Runtime smoke tests (launch, draw a frame, play through the silent clock) don't exist yet on any OS (G-14).
