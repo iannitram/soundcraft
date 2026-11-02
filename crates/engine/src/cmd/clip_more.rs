@@ -264,14 +264,19 @@ fn conform(e: &mut Engine, p: &Value) -> Result<Value> {
         }
         let bpm_key = format!("clip.bpm.{}", cid.0);
         let len_key = format!("clip.len0.{}", cid.0);
+        let applied_len_key = format!("clip.lenapplied.{}", cid.0);
         let stretch = if c.stretch.is_finite() && c.stretch > 0.0 { c.stretch } else { 1.0 };
         let now = s.tempo.tempo_at_tick(s.tempo.samples_to_ticks(c.start, s.sample_rate));
         let src_bpm = given.unwrap_or_else(|| s.edit.value(&bpm_key, now));
-        let len0 = s.edit.value(&len_key, c.length as f64 / stretch).max(1.0);
+        let current_len0 = c.length as f64 / stretch;
+        let last_applied_len = s.edit.values.get(&applied_len_key).copied();
+        let len0 =
+            if last_applied_len.is_some_and(|len| len == c.length as f64) { s.edit.value(&len_key, current_len0) } else { current_len0 }.max(1.0);
         s.edit.values.insert(bpm_key, src_bpm);
         s.edit.values.insert(len_key, len0);
         let ratio = (src_bpm / now).clamp(0.05, 20.0);
         let new_len = ((len0 * ratio).round() as Samples).max(1);
+        s.edit.values.insert(applied_len_key, new_len as f64);
         if let Some(cl) = s.find_clip_mut(cid) {
             cl.stretch = ratio;
             cl.length = new_len;
