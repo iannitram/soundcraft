@@ -85,7 +85,11 @@ fn not_found() -> std::io::Error {
 fn assert_refused(got: &Invoke, port: u16) {
     assert_eq!((got.code, got.stdout.as_str()), (1, ""));
     let prefix = format!("error: cannot reach SoundCraft at 127.0.0.1:{port}: ");
-    assert!(got.stderr.starts_with(&prefix) && got.stderr.contains(" (os error ") && got.stderr.ends_with(")\n"), "{}", got.stderr);
+    // A refusal carries the OS error code. On Windows an unanswered connect can instead hit the
+    // 800 ms `connect_timeout` in crates/automation/src/lib.rs, which has no OS code: accept that text there only.
+    let refused = got.stderr.contains(" (os error ") && got.stderr.ends_with(")\n");
+    let timed_out = cfg!(windows) && got.stderr.ends_with("connection timed out\n");
+    assert!(got.stderr.starts_with(&prefix) && (refused || timed_out), "{}", got.stderr);
 }
 
 // ---- unknown flags ----
