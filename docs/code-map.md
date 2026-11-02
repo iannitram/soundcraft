@@ -2,7 +2,7 @@
 
 The code is upstream's Cargo workspace (`Cargo.toml` members). Upstream's own design notes are in `docs/` (start with `docs/control-protocol.md`, `docs/hardware-parity.md`, `docs/plugin-parity.md`). This map is ours: what each module owns, how they connect, and what differs per platform (R04). The quality gate for every module is `cargo xtask ci`.
 
-Describes commit: 33bfcca (2026-10-28). The workspace is 14 crates, 3 apps and `xtask` (version 0.13.1), on branch `main`. Upstream owns every crate and file except the changes listed under "Where our delta lives"; at this commit upstream `main` is 59 commits ahead of ours (the next fork sync brings them in).
+Describes commit: 76ce08a (2026-11-02). The workspace is 14 crates, 3 apps and `xtask` (version 0.16.0), on branch `main`. Upstream owns every crate and file except the changes listed under "Where our delta lives"; at this commit ours contains all of upstream `main` (8444edf: 0 behind) and is 118 commits ahead of it.
 
 ## Modules
 
@@ -46,7 +46,7 @@ Upstream's layer rule (checked by `cargo xtask ci`): lower crates never depend o
 
 ## Where our delta lives
 
-`git diff upstream/main...main` touches 18 files under `crates/` and `.github/` (about +2,300 / -130), beyond docs, pipeline files and the lock file: `crates/model/src/source.rs` and `clip.rs` (disk-backed sources), `crates/mix/src/readahead.rs` and `lib.rs` (read-ahead), `crates/audio-io/src/pcm.rs`, `crates/dsp/src/offline.rs` and `meter.rs`, `crates/engine/src/{edit,io}.rs`, `cmd/edit.rs`, `cmd/audiosuite.rs` and `examples/bench.rs`, `crates/playback/src/{lib,record}.rs`, `.github/workflows/pr-ci.yml`, and the `rtrb` dependency and `max` profile in `Cargo.toml`. Not yet in the tree: the MP3 encoder, the Linux handheld work (JACK/PipeWire, SIMD, GPU waveforms) and the gamepad/pen/NPU items in `SPEC.md`.
+`git diff --stat upstream/main HEAD` at the describes commit touches 45 files: 32 under `crates/` and `.github/` (+2,347 / -135), and 13 more (docs, pipeline files, `Cargo.toml`, the lock file, the CLI behaviour tests and CHANGELOG). The main areas: `crates/model/src/source.rs` and `clip.rs` (disk-backed sources, fade clamping), `crates/mix/` (read-ahead in `readahead.rs`, clips, pan, strip, tests), `crates/audio-io/src/{lib,pcm}.rs`, `crates/dsp/src/{offline,meter}.rs`, `crates/engine/src/{edit,io}.rs`, `io/{bundle,import,record}.rs`, `cmd/edit.rs`, `cmd/audiosuite.rs` and `examples/bench.rs`, `crates/playback/src/{callback,record,tests}.rs`, `crates/vst3-host/` (plugin, instance, tests and fixture), `.github/workflows/pr-ci.yml`, and the `rtrb` dependency and `max` profile in `Cargo.toml`. Not yet in the tree: the MP3 encoder, the Linux handheld work (JACK/PipeWire, SIMD, GPU waveforms) and the gamepad/pen/NPU items in `SPEC.md`.
 
 ## Mac, PC and Linux
 
