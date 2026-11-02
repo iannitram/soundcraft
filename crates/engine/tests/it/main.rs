@@ -3,6 +3,7 @@
 mod bounce;
 mod clap_e2e;
 mod commit_multichannel;
+mod conform_after_edit;
 mod consolidate_selection;
 mod current_feet_frames_position;
 mod edit_modes;
