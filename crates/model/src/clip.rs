@@ -300,6 +300,8 @@ impl Clip {
     /// Keep both fades within the clip, and from overlapping each other: when together they
     /// are longer than the clip, both shrink in proportion. (Overlapping fades multiply, so the
     /// middle of the clip would dip: two linear fades over the whole clip leave it at -12 dB.)
+    /// Whether Audition shrinks them the same way is still to be checked: see
+    /// https://github.com/iannitram/soundcraft/issues/62.
     pub fn clamp_fades(&mut self) {
         let length = self.length.max(0);
         self.fade_in.len = self.fade_in.len.max(0);
