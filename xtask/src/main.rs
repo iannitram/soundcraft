@@ -1,6 +1,7 @@
 //! `cargo xtask <ci|test|layers|assets|parity|wasm>` — repository gates.
 
 mod ico;
+mod smoke;
 mod version;
 
 use std::collections::BTreeSet;
@@ -255,7 +256,8 @@ fn main() -> ExitCode {
         Some("wasm") => wasm(),
         Some("version") => version::run(args.get(1..).unwrap_or(&[])),
         Some("ico") => ico::run(args.get(1..).unwrap_or(&[])),
-        _ => Err("usage: cargo xtask <ci|test|layers|assets|parity|wasm|version>".into()),
+        Some("smoke") => smoke::run(),
+        _ => Err("usage: cargo xtask <ci|test|layers|assets|parity|wasm|version|smoke>".into()),
     };
     match r {
         Ok(()) => ExitCode::SUCCESS,
