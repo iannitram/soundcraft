@@ -297,11 +297,11 @@ fn layer(e: &mut Engine, p: &Value, front: bool) -> Result<Value> {
 }
 
 /// The most loops `clip.loop` makes of one clip.
-const MAX_LOOPS: i64 = 1000;
+pub const MAX_LOOPS: i64 = 1000;
 
 fn loop_clips(e: &mut Engine, p: &Value) -> Result<Value> {
     let ids = clip_ids_param(e, p);
-    let count = i64_or(p, "count", 4).clamp(1, 512);
+    let count = i64_or(p, "count", 4).clamp(1, MAX_LOOPS + 1);
     let total = position_param(e, "clip.loop", p, "length")?;
     let fill = p.get("fill").and_then(Value::as_bool).unwrap_or(false);
     let s = e.session_mut();

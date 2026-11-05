@@ -11,6 +11,7 @@ mod fader_merge_full_history;
 mod hostile_params;
 mod hostile_sessions;
 mod long_renders;
+mod loop_limit;
 mod midi_offset;
 mod min_secs_with_timecode_counter;
 mod mix_required_params;
