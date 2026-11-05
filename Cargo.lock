@@ -6200,6 +6200,7 @@ name = "xtask"
 version = "0.17.0"
 dependencies = [
  "serde_json",
+ "soundcraft-audio-io",
 ]
 
 [[package]]
