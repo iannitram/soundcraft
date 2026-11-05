@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use dirty::same_document;
 
-pub use cmd::{CommandInfo, CommandSpec, command_specs, find_command};
+pub use cmd::{CommandInfo, CommandSpec, MAX_LOOPS, command_specs, find_command};
 pub use soundcraft_model as model;
 
 /// Upper bound on journaled commands, so a long session cannot grow memory without limit.
