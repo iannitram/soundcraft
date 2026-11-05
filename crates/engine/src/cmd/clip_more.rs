@@ -2,7 +2,7 @@
 //! Remove Pitch Shift.
 use super::{CommandSpec, bad, clip_ids_param, has_selection, str_param};
 
-use super::more_util::{render_stretched, replace_clip};
+use super::more_util::{max_render, render_stretched, replace_clip};
 use crate::{Engine, Result, cmd};
 use serde_json::{Value, json};
 use soundcraft_model::{Clip, ClipContent, ClipId, Session, TrackId};
@@ -296,7 +296,10 @@ fn remove_pitch_shift(e: &mut Engine, p: &Value) -> Result<Value> {
     for cid in ids {
         let Some((t, c)) = s.find_clip(cid).map(|(t, c)| (t, c.clone())) else { continue };
         s.edit.values.remove(&format!("clip.pitch.{}", cid.0));
-        if !c.is_audio() || (c.stretch - 1.0).abs() < 1e-9 || !c.stretch.is_finite() {
+        if !c.is_audio() || c.edit_locked || (c.stretch - 1.0).abs() < 1e-9 || !c.stretch.is_finite() {
+            continue;
+        }
+        if c.length > max_render(s) {
             continue;
         }
         let Some(src) = render_stretched(s, id, &c, c.length)? else { continue };
