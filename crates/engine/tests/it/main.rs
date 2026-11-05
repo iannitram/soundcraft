@@ -18,6 +18,7 @@ mod mix_required_params;
 mod new_track_rows;
 mod random_edits;
 mod recording;
+mod remove_pitch_shift;
 mod session_transport;
 mod split_into_mono;
 mod time_key_signatures;
