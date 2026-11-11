@@ -46,7 +46,7 @@ pub(crate) fn at_rate(mut buf: AudioBuffer, rate: u32, limit: usize) -> std::res
     }
     // Refuse what the resampler would cut short rather than keep a shortened file.
     if !soundcraft_dsp::offline::resample_fits(buf.frames(), from, rate) {
-        return None;
+        return Err(RateError::TooLarge);
     }
     if from != rate {
         soundcraft_dsp::offline::resample_in_place(&mut buf.channels, from, rate);
