@@ -144,7 +144,8 @@ const PARALLEL_MIN_FRAMES: usize = 1 << 16;
 struct ChannelRun<'a> {
     filters: [Biquad; 2],
     acc: f64,
-    hist: [f32; TP_TAPS],
+    hist: [f32; 2 * TP_TAPS],
+    pos: usize,
     peak: f32,
     /// Energy of each sub-block completed during the call.
     blocks: Vec<f64>,
@@ -163,43 +164,30 @@ fn k_weighted_energy(f: &mut [Biquad; 2], x: &[f32], mut acc: f64) -> f64 {
     acc
 }
 
-/// Highest sample or 4x-interpolated peak over `x`, continuing the interpolator history `h`
-/// (`h[k]` is the input `k` samples ago). Each phase sums its taps in the same order as a
-/// sample-at-a-time loop.
-fn true_peak_run(coefs: &[[f32; TP_TAPS]; TP_PHASES], h: &mut [f32; TP_TAPS], x: &[f32]) -> f32 {
-    const CHUNK: usize = 256;
-    // `buf[i]` holds the input at chunk time `i - (TP_TAPS - 1)`: history first, oldest first.
-    let mut buf = [0.0f32; CHUNK + TP_TAPS - 1];
+/// Highest sample or 4x-interpolated peak over `x`, continuing the interpolator history in the
+/// doubled ring `h` (`pos` is the newest sample's slot; `h[pos..pos + TP_TAPS]` is the input
+/// history, newest first). Each phase sums its taps in the same order as a shifted-history loop.
+fn true_peak_run(coefs: &[[f32; TP_PHASES]; TP_TAPS], h: &mut [f32; 2 * TP_TAPS], pos: &mut usize, x: &[f32]) -> f32 {
     let mut peak = 0.0f32;
-    for part in x.chunks(CHUNK) {
-        for (d, s) in buf.iter_mut().zip(h.iter().rev()) {
-            *d = *s;
-        }
-        for (d, &v) in buf.iter_mut().skip(TP_TAPS - 1).zip(part) {
-            *d = if v.is_finite() { v } else { 0.0 };
-        }
-        let n = part.len();
-        for v in buf.iter().skip(TP_TAPS - 1).take(n) {
-            peak = peak.max(v.abs());
-        }
-        // Each phase is a 12-tap FIR. Looping over time inside each tap keeps every output's
-        // sum in tap order (bit-identical to a per-sample loop) and vectorizes across samples.
-        for ph in coefs {
-            let mut y = [0.0f32; CHUNK];
-            for (k, &c) in ph.iter().enumerate() {
-                let Some(src) = buf.get(TP_TAPS - 1 - k..TP_TAPS - 1 - k + n) else { continue };
-                for (o, &v) in y.iter_mut().zip(src) {
-                    *o += c * v;
-                }
-            }
-            for o in y.iter().take(n) {
-                peak = peak.max(o.abs());
+    for &v in x {
+        let v = if v.is_finite() { v } else { 0.0 };
+        *pos = (*pos + TP_TAPS - 1) % TP_TAPS;
+        let p = *pos;
+        for slot in [p, p + TP_TAPS] {
+            if let Some(d) = h.get_mut(slot) {
+                *d = v;
             }
         }
-        // New history: the last TP_TAPS inputs, newest first.
-        let end = TP_TAPS - 1 + part.len();
-        for (k, d) in h.iter_mut().enumerate() {
-            *d = end.checked_sub(1 + k).and_then(|i| buf.get(i)).copied().unwrap_or(0.0);
+        let Some(w) = h.get(p..p + TP_TAPS).and_then(|w| <&[f32; TP_TAPS]>::try_from(w).ok()) else { continue };
+        let mut y = [-0.0f32; TP_PHASES];
+        for (cs, s) in coefs.iter().zip(w) {
+            for (acc, k) in y.iter_mut().zip(cs) {
+                *acc += k * s;
+            }
+        }
+        peak = peak.max(v.abs());
+        for o in y {
+            peak = peak.max(o.abs());
         }
     }
     peak
@@ -219,8 +207,9 @@ pub struct LoudnessMeter {
     sub_filled: usize,
     hist_count: Vec<u64>,
     hist_energy: Vec<f64>,
-    tp_coefs: [[f32; TP_TAPS]; TP_PHASES],
-    tp_hist: Vec<[f32; TP_TAPS]>,
+    tp_coefs: [[f32; TP_PHASES]; TP_TAPS],
+    tp_hist: Vec<[f32; 2 * TP_TAPS]>,
+    tp_pos: Vec<usize>,
     true_peak: f32,
     max_momentary: f32,
 }
@@ -266,7 +255,7 @@ impl LoudnessMeter {
         let weights = if channels == 6 { vec![1.0, 1.0, 1.0, 0.0, 1.41, 1.41] } else { vec![1.0; channels] };
         let [c1, c2] = k_weighting(sr);
         // Interpolation filter: windowed sinc at the original Nyquist, split into 4 phases.
-        let mut tp_coefs = [[0.0f32; TP_TAPS]; TP_PHASES];
+        let mut tp_coefs = [[0.0f32; TP_PHASES]; TP_TAPS];
         let total = TP_TAPS * TP_PHASES;
         let center = (total as f64 - 1.0) / 2.0;
         for i in 0..total {
@@ -274,14 +263,14 @@ impl LoudnessMeter {
             let sinc = if t.abs() < 1e-12 { 1.0 } else { (std::f64::consts::PI * t).sin() / (std::f64::consts::PI * t) };
             let x = i as f64 / (total as f64 - 1.0);
             let w = 0.42 - 0.5 * (2.0 * std::f64::consts::PI * x).cos() + 0.08 * (4.0 * std::f64::consts::PI * x).cos();
-            if let Some(slot) = tp_coefs.get_mut(i % TP_PHASES).and_then(|ph| ph.get_mut(i / TP_PHASES)) {
+            if let Some(slot) = tp_coefs.get_mut(i / TP_PHASES).and_then(|tap| tap.get_mut(i % TP_PHASES)) {
                 *slot = (sinc * w) as f32;
             }
         }
-        for ph in &mut tp_coefs {
-            let s: f32 = ph.iter().sum();
+        for p in 0..TP_PHASES {
+            let s: f32 = tp_coefs.iter().filter_map(|tap| tap.get(p)).sum();
             if s.abs() > 1e-6 {
-                ph.iter_mut().for_each(|c| *c /= s);
+                tp_coefs.iter_mut().filter_map(|tap| tap.get_mut(p)).for_each(|c| *c /= s);
             }
         }
         Self {
@@ -297,7 +286,8 @@ impl LoudnessMeter {
             hist_count: vec![0; HIST_BINS],
             hist_energy: vec![0.0; HIST_BINS],
             tp_coefs,
-            tp_hist: vec![[0.0; TP_TAPS]; channels],
+            tp_hist: vec![[0.0; 2 * TP_TAPS]; channels],
+            tp_pos: vec![0; channels],
             true_peak: 0.0,
             max_momentary: MIN_DB,
         }
@@ -326,7 +316,8 @@ impl LoudnessMeter {
         self.sub_filled = 0;
         self.hist_count.iter_mut().for_each(|v| *v = 0);
         self.hist_energy.iter_mut().for_each(|v| *v = 0.0);
-        self.tp_hist.iter_mut().for_each(|h| *h = [0.0; TP_TAPS]);
+        self.tp_hist.iter_mut().for_each(|h| *h = [0.0; 2 * TP_TAPS]);
+        self.tp_pos.iter_mut().for_each(|p| *p = 0);
         self.true_peak = 0.0;
         self.max_momentary = MIN_DB;
     }
@@ -348,9 +339,13 @@ impl LoudnessMeter {
             let len = (self.block_len - self.block_pos).min(frames - n);
             for c in 0..ch {
                 let Some(x) = io.get(c).and_then(|b| b.get(n..n + len)) else { continue };
-                let (Some(f), Some(acc), Some(h)) = (self.filters.get_mut(c), self.block_acc.get_mut(c), self.tp_hist.get_mut(c)) else { continue };
+                let (Some(f), Some(acc), Some(h), Some(pos)) =
+                    (self.filters.get_mut(c), self.block_acc.get_mut(c), self.tp_hist.get_mut(c), self.tp_pos.get_mut(c))
+                else {
+                    continue;
+                };
                 *acc = k_weighted_energy(f, x, *acc);
-                self.true_peak = self.true_peak.max(true_peak_run(&self.tp_coefs, h, x));
+                self.true_peak = self.true_peak.max(true_peak_run(&self.tp_coefs, h, pos, x));
             }
             n += len;
             self.block_pos += len;
@@ -371,12 +366,14 @@ impl LoudnessMeter {
             .iter()
             .zip(&self.block_acc)
             .zip(&self.tp_hist)
+            .zip(&self.tp_pos)
             .zip(io)
             .take(ch)
-            .map(|(((f, acc), h), x)| ChannelRun {
+            .map(|((((f, acc), h), pos), x)| ChannelRun {
                 filters: *f,
                 acc: *acc,
                 hist: *h,
+                pos: *pos,
                 peak: 0.0,
                 blocks: Vec::new(),
                 input: x.get(..frames).unwrap_or_default(),
@@ -389,7 +386,7 @@ impl LoudnessMeter {
                 let len = (block_len - pos).min(w.input.len() - n);
                 let Some(x) = w.input.get(n..n + len) else { break };
                 w.acc = k_weighted_energy(&mut w.filters, x, w.acc);
-                w.peak = w.peak.max(true_peak_run(&coefs, &mut w.hist, x));
+                w.peak = w.peak.max(true_peak_run(&coefs, &mut w.hist, &mut w.pos, x));
                 n += len;
                 pos += len;
                 if pos >= block_len {
@@ -421,10 +418,13 @@ impl LoudnessMeter {
             self.finish_sub_block();
         }
         for (c, w) in work.into_iter().enumerate() {
-            if let (Some(f), Some(acc), Some(h)) = (self.filters.get_mut(c), self.block_acc.get_mut(c), self.tp_hist.get_mut(c)) {
+            if let (Some(f), Some(acc), Some(h), Some(pos)) =
+                (self.filters.get_mut(c), self.block_acc.get_mut(c), self.tp_hist.get_mut(c), self.tp_pos.get_mut(c))
+            {
                 *f = w.filters;
                 *acc = w.acc;
                 *h = w.hist;
+                *pos = w.pos;
             }
             self.true_peak = self.true_peak.max(w.peak);
         }
@@ -533,13 +533,21 @@ mod tests {
                         *acc += f64::from(y) * f64::from(y);
                     }
                 }
-                if let Some(h) = m.tp_hist.get_mut(c) {
-                    h.copy_within(0..TP_TAPS - 1, 1);
-                    h[0] = x;
+                if let (Some(h), Some(pos)) = (m.tp_hist.get_mut(c), m.tp_pos.get_mut(c)) {
+                    // Sample at a time through the doubled ring.
+                    *pos = (*pos + TP_TAPS - 1) % TP_TAPS;
+                    let p = *pos;
+                    h[p] = x;
+                    h[p + TP_TAPS] = x;
+                    let mut y = [-0.0f32; TP_PHASES];
+                    for (cs, s) in m.tp_coefs.iter().zip(&h[p..p + TP_TAPS]) {
+                        for (acc, k) in y.iter_mut().zip(cs) {
+                            *acc += k * s;
+                        }
+                    }
                     let mut peak = x.abs();
-                    for ph in &m.tp_coefs {
-                        let y: f32 = ph.iter().zip(h.iter()).map(|(a, b)| a * b).sum();
-                        peak = peak.max(y.abs());
+                    for v in y {
+                        peak = peak.max(v.abs());
                     }
                     if peak > m.true_peak {
                         m.true_peak = peak;
@@ -581,12 +589,13 @@ mod tests {
         [m.integrated_lufs(), m.momentary_lufs(), m.short_term_lufs(), m.max_momentary_lufs(), m.true_peak_db()].map(f32::to_bits)
     }
 
-    fn state(m: &LoudnessMeter) -> (Vec<u64>, Vec<u64>, usize, Vec<[u32; TP_TAPS]>) {
+    fn state(m: &LoudnessMeter) -> (Vec<u64>, Vec<u64>, usize, Vec<[u32; 2 * TP_TAPS]>, Vec<usize>) {
         (
             m.block_acc.iter().map(|v| v.to_bits()).collect(),
             m.hist_energy.iter().map(|v| v.to_bits()).collect(),
             m.block_pos,
             m.tp_hist.iter().map(|h| h.map(f32::to_bits)).collect(),
+            m.tp_pos.clone(),
         )
     }
 
@@ -625,5 +634,60 @@ mod tests {
         reference(&mut r, &[vec![0.5; 10]], 1_000);
         reference(&mut r, &[vec![0.5; 100_000], vec![0.5; 70_000]], 200_000);
         assert_eq!(readings(&m), readings(&r));
+    }
+
+    fn noise(len: usize, seed: u64, amp: f32) -> Vec<f32> {
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                ((x >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0) * amp
+            })
+            .collect()
+    }
+
+    /// True peak as first written: the history shifted every sample, each phase summed on its own.
+    fn true_peak_reference(coefs: &[[f32; TP_PHASES]; TP_TAPS], x: &[f32]) -> f32 {
+        let mut h = [0.0f32; TP_TAPS];
+        let mut tp = 0.0f32;
+        for v in x.iter().map(|v| if v.is_finite() { *v } else { 0.0 }) {
+            h.copy_within(0..TP_TAPS - 1, 1);
+            h[0] = v;
+            let mut peak = v.abs();
+            for p in 0..TP_PHASES {
+                let y: f32 = coefs.iter().zip(h.iter()).map(|(c, b)| c[p] * b).sum();
+                peak = peak.max(y.abs());
+            }
+            if peak > tp {
+                tp = peak;
+            }
+        }
+        tp
+    }
+
+    #[test]
+    fn true_peak_matches_the_shifted_history() {
+        let sr = 48_000.0;
+        let len = 20_000;
+        let mut l: Vec<f32> =
+            (0..len).map(|i| 0.6 * (std::f32::consts::TAU * 0.25 * i as f32 + 0.7).sin()).zip(noise(len, 1, 0.3)).map(|(a, b)| a + b).collect();
+        let r = noise(len, 2, 0.9);
+        l[123] = f32::NAN;
+        l[4_567] = f32::INFINITY;
+        for block in [1, 7, 480, len] {
+            let mut m = LoudnessMeter::new(sr, 2);
+            let want = true_peak_reference(&m.tp_coefs, &l).max(true_peak_reference(&m.tp_coefs, &r));
+            for at in (0..len).step_by(block) {
+                let n = block.min(len - at);
+                m.process(&[l[at..at + n].to_vec(), r[at..at + n].to_vec()], n);
+            }
+            assert_eq!(m.true_peak.to_bits(), want.to_bits(), "block {block}");
+            m.reset();
+            let quiet = noise(500, 3, 0.1);
+            m.process(&[quiet.clone(), quiet.clone()], 500);
+            assert_eq!(m.true_peak.to_bits(), true_peak_reference(&m.tp_coefs, &quiet).to_bits(), "after reset, block {block}");
+        }
     }
 }
