@@ -8,10 +8,11 @@ Describes commit: 54fcdd2 (2026-11-02). The workspace is 14 crates, 3 apps and `
 
 | Path | Crate | Owns | Platform notes |
 |---|---|---|---|
+| `craft-audio` (craft-libs, git) | craft-audio | Audio file I/O and codecs, upstream's since sync 2026-11-16 (it replaced `crates/audio-io`) | pure, all |
 | `crates/time` | soundcraft-time | Timebases: samples, Bars\|Beats, Min:Secs, Timecode, Feet+Frames, tempo and meter maps, grid | pure, all |
-| `crates/audio-io` | soundcraft-audio-io | Audio file I/O: WAV/BWF/RF64, AIFF/AIFF-C, FLAC encoder, symphonia decoders; streamed PCM reads for the disk-backed sources (`crates/audio-io/src/pcm.rs`, ours in part) | pure, all |
 | `crates/midi` | soundcraft-midi | Note/controller sequences, SMF import/export, MIDI editing, GM names. No device I/O yet (G-02) | pure, all; device layer will be per OS (CoreMIDI, WinMM, ALSA) |
-| `crates/model` | soundcraft-model | The session document: tracks, playlists, clips, mixer, routing, automation, markers (`.scraft`); the `SampleSource` trait and the disk-backed source behind clips (`crates/model/src/source.rs`, ours in part) | pure, all |
+| `crates/model` | soundcraft-model | Upstream's compatibility facade: re-exports `craft-scraft-format` (the session document) under the old name | pure, all |
+| `crates/scraft-format` | craft-scraft-format | The session document: tracks, playlists, clips, mixer, routing, automation, markers (`.scraft`), bundle read/write. Upstream takes it from craft-libs; the fork builds this copy of it because it carries our changes: the `SampleSource` trait and streamed sources, non-overlapping fades, the crossfade original edit point (`crates/scraft-format/FORK.md`) | pure, all |
 | `crates/dsp` | soundcraft-dsp | Built-in realtime plugins, meters, loudness, offline processing (reads sources through `dsp`'s own `SampleSource` trait; streamed offline passes are ours); the safe plugin trait the hosts implement | pure, all; SIMD paths must dispatch at runtime |
 | `crates/clap-host` | soundcraft-clap-host | Third-party CLAP hosting behind the dsp plugin trait | all; editors embedded on Windows and macOS |
 | `crates/vst3-host` | soundcraft-vst3-host | Third-party VST3 hosting; `Vst3Plugin::reactivate()` flushes a plugin's internal state (ours) | all; editors on macOS and Windows, not Linux (upstream PR #1127 adds X11) |

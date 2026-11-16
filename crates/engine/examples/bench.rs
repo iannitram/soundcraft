@@ -13,7 +13,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use soundcraft_audio_io::{AudioBuffer, BitDepth, EncodeOptions, FileFormat, peaks::Peaks};
+use craft_audio::{AudioBuffer, BitDepth, EncodeFormat, EncodeOptions, peaks::Peaks};
 use soundcraft_dsp::meter::LoudnessMeter;
 use soundcraft_model::{ChannelFormat, Clip, Session, SourceAudio, SourceId, TrackKind};
 use soundcraft_time::Range;
@@ -97,10 +97,10 @@ fn main() {
         results.push((name.to_string(), d, note));
     };
 
-    let wav_opts = EncodeOptions { format: FileFormat::Wav, bit_depth: BitDepth::Float32, dither: false, bwf: None };
+    let wav_opts = EncodeOptions::new(EncodeFormat::Wav).with_bit_depth(BitDepth::Float32);
     let wav = if want("wav_encode") || want("wav_decode") {
         let t = Instant::now();
-        let bytes = soundcraft_audio_io::encode(&buf, &wav_opts).unwrap_or_default();
+        let bytes = craft_audio::encode(&buf, &wav_opts).unwrap_or_default();
         record("wav_encode", t.elapsed(), format!("{} MB", bytes.len() / 1_000_000));
         bytes
     } else {
@@ -108,14 +108,14 @@ fn main() {
     };
     if want("wav_decode") {
         let t = Instant::now();
-        let frames_back = soundcraft_audio_io::decode(&wav, Some("wav")).map_or(0, |(_, b)| b.frames());
+        let frames_back = craft_audio::decode(&wav, Some("wav")).map_or(0, |(_, b)| b.frames());
         record("wav_decode", t.elapsed(), format!("{frames_back} frames"));
     }
     drop(wav);
     if want("flac_encode") {
-        let opts = EncodeOptions { format: FileFormat::Flac, bit_depth: BitDepth::Int24, dither: false, bwf: None };
+        let opts = EncodeOptions::new(EncodeFormat::Flac).with_bit_depth(BitDepth::Int24);
         let t = Instant::now();
-        let n = soundcraft_audio_io::encode(&buf, &opts).map_or(0, |b| b.len());
+        let n = craft_audio::encode(&buf, &opts).map_or(0, |b| b.len());
         record("flac_encode", t.elapsed(), format!("24-bit, {} MB", n / 1_000_000));
     }
     if want("peaks") {

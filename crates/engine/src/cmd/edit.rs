@@ -1252,8 +1252,8 @@ mod tests {
     fn two_clips_one_file() -> (Engine, soundcraft_model::TrackId, ClipId, ClipId) {
         let mut s = Session::default();
         let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
-        let buf = soundcraft_audio_io::AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.1; 480_000]] };
-        let src = crate::io::add_source(&mut s, "f", buf, None, soundcraft_audio_io::FileFormat::Wav);
+        let buf = craft_audio::AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.1; 480_000]] };
+        let src = crate::io::add_source(&mut s, "f", buf, None, soundcraft_model::FileFormat::Wav);
         let (a, b) = (s.new_clip_id(), s.new_clip_id());
         ops::place_clip(&mut s, t, Clip::audio(a, "a", src, 0, 0, 48_000));
         ops::place_clip(&mut s, t, Clip::audio(b, "b", src, 96_000, 48_000, 48_000));
@@ -1310,8 +1310,8 @@ mod tests {
         use soundcraft_model::{ChannelFormat, Clip, TrackKind};
         let mut s = Session::default();
         let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
-        let buf = soundcraft_audio_io::AudioBuffer { sample_rate: s.sample_rate.hz(), channels: vec![vec![0.25; 60_000]] };
-        let src = crate::io::add_source(&mut s, "src", buf, None, soundcraft_audio_io::FileFormat::Wav);
+        let buf = craft_audio::AudioBuffer { sample_rate: s.sample_rate.hz(), channels: vec![vec![0.25; 60_000]] };
+        let src = crate::io::add_source(&mut s, "src", buf, None, soundcraft_model::FileFormat::Wav);
         let mut ids = Vec::new();
         for &(start, len, off) in clips {
             let id = s.new_clip_id();

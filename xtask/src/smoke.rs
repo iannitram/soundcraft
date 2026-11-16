@@ -4,7 +4,7 @@
 //! with `soundcraft-cli run`, then checks the bounce is 2 s long, stereo and at the same level.
 
 use crate::{cargo_bin, root};
-use soundcraft_audio_io::{AudioBuffer, EncodeOptions, decode, encode};
+use craft_audio::{AudioBuffer, EncodeOptions, decode, encode};
 use std::path::Path;
 use std::process::Command;
 

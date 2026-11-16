@@ -1,6 +1,7 @@
+use craft_audio::AudioBuffer;
 use serde_json::json;
-use soundcraft_audio_io::{AudioBuffer, FileFormat};
 use soundcraft_engine::{Engine, io};
+use soundcraft_model::FileFormat;
 use soundcraft_model::{ChannelFormat, Clip, ClipId, Session, SourceId, TrackKind};
 use soundcraft_time::SampleRate;
 

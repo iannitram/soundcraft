@@ -1,13 +1,13 @@
 use super::render::sanitize_name;
 use super::session::decode_source;
-use super::{Arc, EncodeOptions, Engine, EngineError, FileFormat, OsStr, Path, Result, Session, SourceAudio, read_bundle, write_file};
+use super::{Arc, Engine, EngineError, OsStr, Path, Result, Session, SourceAudio, read_bundle, session_limit, write_file};
 
 // ─── Hosts without a filesystem (the browser) ─────────────────────────────────────────────────
 
 /// Extension of a session bundle: one zip file holding the `.scraft` session and its
 /// `Audio Files/`, the same layout as a saved session folder. The browser has no folders, so it
 /// saves and opens sessions as bundles.
-pub const BUNDLE_EXTENSION: &str = "scraftz";
+pub const BUNDLE_EXTENSION: &str = craft_scraft_format::BUNDLE_EXTENSION;
 
 /// Most entries and bytes a bundle may unpack to (bundles are hostile input). The writer keeps to
 /// them too, so a bundle it saves always opens again (#433).
@@ -28,16 +28,12 @@ pub fn session_bundle(session: &Session) -> Result<(Vec<u8>, Session)> {
 
 /// [`session_bundle`], refused when it would hold more than `limits` allows.
 fn session_bundle_within(session: &Session, limits: BundleLimits) -> Result<(Vec<u8>, Session)> {
-    use std::io::Write as _;
-    let zerr = |err: zip::result::ZipError| EngineError::Io(format!("bundle: {err}"));
-    let ioerr = |err: std::io::Error| EngineError::Io(format!("bundle: {err}"));
-    let mut s = session.clone();
     // Refuse up front, before the audio is packed into memory, what `read_bundle` would refuse to
     // open. Audio is stored as 32-bit float WAV (4 bytes per sample).
-    let audio_bytes: u64 = s
+    let audio_bytes: u64 = session
         .sources
         .iter()
-        .filter(|x| s.pool.get(x.id).is_some())
+        .filter(|x| session.pool.get(x.id).is_some())
         .map(|x| x.frames.saturating_mul(u64::from(x.channels)).saturating_mul(4).saturating_add(4096))
         .fold(0, u64::saturating_add);
     if audio_bytes > limits.bytes {
@@ -47,52 +43,8 @@ fn session_bundle_within(session: &Session, limits: BundleLimits) -> Result<(Vec
             limits.bytes >> 20
         )));
     }
-    let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored).large_file(true);
-    // Sources whose audio is missing keep their old path; never hand that file name to another
-    // source, or reopening loads its audio into the missing one.
-    let mut taken: std::collections::HashSet<String> = s.sources.iter().filter(|x| s.pool.get(x.id).is_none()).map(|x| x.path.clone()).collect();
-    let (mut entries, mut total) = (0usize, 0u64);
-    // Counted as the reader counts them: files, and the bytes they unpack to.
-    let mut fits = |len: usize| {
-        entries += 1;
-        total = total.saturating_add(len as u64);
-        if entries > limits.entries || total > limits.bytes {
-            return Err(EngineError::Io(format!(
-                "bundle: too large to save (a bundle holds at most {} files and {} MiB, or it can't be opened again)",
-                limits.entries,
-                limits.bytes >> 20
-            )));
-        }
-        Ok(())
-    };
-    for src in &mut s.sources {
-        let Some(audio) = s.pool.get(src.id) else { continue };
-        let base = sanitize_name(&src.name);
-        let mut target = format!("Audio Files/{base}.wav");
-        let mut k = 1;
-        while taken.contains(&target) && k <= 9_999 {
-            target = format!("Audio Files/{base}_{k:02}.wav");
-            k += 1;
-        }
-        let opts_wav = EncodeOptions { format: FileFormat::Wav, bit_depth: soundcraft_audio_io::BitDepth::Float32, dither: false, bwf: None };
-        let bytes = soundcraft_audio_io::encode(&audio.buffer, &opts_wav).map_err(|err| EngineError::Io(err.to_string()))?;
-        fits(bytes.len())?;
-        w.start_file(target.as_str(), opts).map_err(zerr)?;
-        w.write_all(&bytes).map_err(ioerr)?;
-        taken.insert(target.clone());
-        src.path = target;
-        src.unsaved = false;
-        src.format = FileFormat::Wav;
-    }
-    let text = s.to_json().map_err(|err| EngineError::Io(err.to_string()))?;
-    // Its session too: one the reader would refuse is not saved (#892).
-    super::session_size("the session", text.len() as u64, true)?;
-    fits(text.len())?;
-    w.start_file(format!("{}.{}", sanitize_name(&s.name), soundcraft_model::SESSION_EXTENSION), opts).map_err(zerr)?;
-    w.write_all(text.as_bytes()).map_err(ioerr)?;
-    let bytes = w.finish().map_err(zerr)?.into_inner();
-    Ok((bytes, s))
+    let shared = craft_scraft_format::BundleLimits { entries: limits.entries, bytes: limits.bytes, session_bytes: session_limit() };
+    craft_scraft_format::write_bundle(session, shared).map_err(|error| EngineError::Io(error.to_string()))
 }
 
 /// Save as a bundle named after `path`'s file name, delivered through the host ([`write_file`]).
@@ -245,6 +197,48 @@ mod bundle_tests {
         let lost = open_session_bytes(&mut r, "x.scraftz", &bytes).unwrap();
         assert!(r.session().pool.get(present).is_some(), "{lost:?}");
         assert!(r.session().pool.get(missing).is_none());
+    }
+
+    #[test]
+    fn legacy_zip64_bundle_opens_with_shared_reader() {
+        use craft_audio::{AudioBuffer, EncodeFormat, EncodeOptions, encode};
+        use soundcraft_model::{FileFormat, Source, SourceId};
+        use std::io::Write as _;
+
+        let id = SourceId(7);
+        let samples = [0.125, -0.75, 1.25, -1.5];
+        let mut audio = AudioBuffer::new(48_000, 1, samples.len());
+        audio.channels[0].copy_from_slice(&samples);
+
+        let mut session = Session::default();
+        session.sources.push(Source {
+            id,
+            name: "Legacy Lead".into(),
+            path: "Audio Files/Legacy Lead.wav".into(),
+            channels: 1,
+            frames: samples.len() as u64,
+            sample_rate: 48_000,
+            format: FileFormat::Wav,
+            time_reference: 0,
+            unsaved: false,
+        });
+        session.pool.insert(id, Arc::new(SourceAudio::new(audio)));
+
+        let wav =
+            encode(&session.pool.get(id).unwrap().buffer, &EncodeOptions::new(EncodeFormat::Wav).with_bit_depth(craft_audio::BitDepth::Float32))
+                .unwrap();
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored).large_file(true);
+        zip.start_file("Audio Files/Legacy Lead.wav", opts).unwrap();
+        zip.write_all(&wav).unwrap();
+        zip.start_file("Legacy.scraft", opts).unwrap();
+        zip.write_all(session.to_json().unwrap().as_bytes()).unwrap();
+        let legacy = zip.finish().unwrap().into_inner();
+
+        let mut opened = Engine::default();
+        let missing = open_session_bytes(&mut opened, "Legacy.scraftz", &legacy).unwrap();
+        assert!(missing.is_empty(), "{missing:?}");
+        assert_eq!(opened.session().pool.get(id).unwrap().buffer.channels[0], samples);
     }
 
     #[test]
